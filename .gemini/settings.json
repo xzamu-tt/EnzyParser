@@ -1,0 +1,16 @@
+{
+    "security": {
+        "auth": {
+            "selectedType": "oauth-personal"
+        }
+    },
+    "mcpServers": {
+        "docling": {
+            "command": "uvx",
+            "args": [
+                "--from=docling-mcp",
+                "docling-mcp-server"
+            ]
+        }
+    }
+}

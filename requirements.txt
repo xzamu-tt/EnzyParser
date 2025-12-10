@@ -1,0 +1,6 @@
+# EnzyParser Dependencies
+docling>=2.64.0
+pydantic>=2.0
+pandas>=2.0
+pillow>=10.0
+openpyxl>=3.1
