@@ -18,6 +18,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
 )
+from docling.datamodel.document import TableItem, PictureItem
 
 # Configure logging
 logging.basicConfig(
@@ -41,12 +42,23 @@ class VisualArtifact(BaseModel):
     source_file: str
 
 
+class TextSegment(BaseModel):
+    """Represents a text block with layout grounding."""
+    id: str
+    type: str  # 'title', 'section_header', 'text', 'list_item', 'caption', 'footnote'
+    text: str
+    page_no: int
+    bbox: List[float]  # [left, top, right, bottom]
+    source_file: str
+
+
 class PaperData(BaseModel):
     """Complete paper representation with all extracted data"""
     paper_id: str  # e.g., Almeida-2019
     original_pdf: str
     metadata: Dict[str, Any]
-    text_content: str
+    text_content: str  # Full markdown (kept for backward compatibility)
+    text_segments: List[TextSegment] = []  # Layout-aware chunks with grounding
     artifacts: List[VisualArtifact] = []
     tables_data: List[Dict] = []
     supplementary_files_processed: List[str] = []
@@ -166,6 +178,94 @@ class EnzymeParser:
         
         logger.info(f"✅ Completed {paper_id}. Output: {paper_out_dir}")
     
+    def _find_extended_caption(self, picture, doc, tolerance: float = 100.0) -> str:
+        """
+        Find extended caption by looking for text blocks physically below the image.
+        
+        Uses geometric proximity heuristic to capture full figure legends that
+        Docling may have classified as regular text instead of captions.
+        
+        Args:
+            picture: The PictureItem from Docling
+            doc: The document object
+            tolerance: Maximum distance in points below the image to search
+        
+        Returns:
+            Combined caption string (base caption + extended text)
+        """
+        # Get base caption from Docling
+        base_caption = ""
+        if hasattr(picture, 'caption_text'):
+            base_caption = picture.caption_text(doc) or ""
+        
+        extended_text = []
+        
+        # Get image coordinates
+        if not picture.prov:
+            return base_caption
+        
+        pic_prov = picture.prov[0]
+        pic_page = pic_prov.page_no
+        pic_bbox = pic_prov.bbox
+        pic_bottom = getattr(pic_bbox, 'b', 0.0)
+        pic_left = getattr(pic_bbox, 'l', 0.0)
+        pic_right = getattr(pic_bbox, 'r', 0.0)
+        
+        # Iterate over all text items on the same page
+        if not hasattr(doc, 'iterate_items'):
+            return base_caption
+        
+        try:
+            for item, level in doc.iterate_items():
+                # Skip non-text items
+                if isinstance(item, (TableItem, PictureItem)):
+                    continue
+                
+                if not hasattr(item, 'prov') or not item.prov:
+                    continue
+                
+                item_prov = item.prov[0]
+                
+                # Only same page
+                if item_prov.page_no != pic_page:
+                    continue
+                
+                # Get text bbox
+                if not hasattr(item_prov, 'bbox') or not item_prov.bbox:
+                    continue
+                
+                text_bbox = item_prov.bbox
+                text_top = getattr(text_bbox, 't', 0.0)
+                text_left = getattr(text_bbox, 'l', 0.0)
+                text_right = getattr(text_bbox, 'r', 0.0)
+                
+                # PROXIMITY CHECK:
+                # 1. Text is BELOW the image (text_top > pic_bottom)
+                # 2. Text is CLOSE (distance < tolerance)
+                distance = text_top - pic_bottom
+                
+                if 0 < distance < tolerance:
+                    # Check horizontal alignment to avoid capturing adjacent columns
+                    text_width = text_right - text_left
+                    if text_width > 0:
+                        horiz_overlap = max(0, min(pic_right, text_right) - max(pic_left, text_left))
+                        overlap_ratio = horiz_overlap / text_width
+                        
+                        # If text overlaps at least 50% with image width
+                        if overlap_ratio > 0.5:
+                            text = getattr(item, 'text', '')
+                            if text and text.strip():
+                                extended_text.append(text.strip())
+        except Exception as e:
+            logger.warning(f"Error finding extended caption: {e}")
+        
+        # Combine base caption with extended text
+        if extended_text:
+            full_caption = base_caption + "\n" + "\n".join(extended_text)
+            return full_caption
+        
+        return base_caption
+    
     def _parse_docling(
         self,
         pdf_path: Path,
@@ -227,9 +327,8 @@ class EnzymeParser:
                         if hasattr(picture, 'annotations') and picture.annotations:
                             vlm_text = picture.annotations[0].text if picture.annotations else ""
                         
-                        caption = ""
-                        if hasattr(picture, 'caption_text'):
-                            caption = picture.caption_text(doc) or ""
+                        # Extract caption using proximity heuristic
+                        caption = self._find_extended_caption(picture, doc, tolerance=100.0)
                         
                         artifact = VisualArtifact(
                             id=f"fig_{i}",
@@ -259,6 +358,66 @@ class EnzymeParser:
                         })
                 except Exception as e:
                     logger.warning(f"Error extracting table: {e}")
+        
+        # Extract text segments with layout grounding
+        if hasattr(doc, 'iterate_items'):
+            segment_counter = 0
+            try:
+                for item, level in doc.iterate_items():
+                    # Skip tables and pictures (handled separately)
+                    if isinstance(item, (TableItem, PictureItem)):
+                        continue
+                    
+                    # Get text content
+                    text = getattr(item, 'text', None)
+                    if not text or not text.strip():
+                        continue
+                    
+                    # Get provenance (coordinates)
+                    bbox = [0.0, 0.0, 0.0, 0.0]
+                    page_no = 0
+                    if hasattr(item, 'prov') and item.prov:
+                        prov = item.prov[0]
+                        if hasattr(prov, 'bbox') and prov.bbox:
+                            b = prov.bbox
+                            bbox = [
+                                getattr(b, 'l', 0.0),
+                                getattr(b, 't', 0.0),
+                                getattr(b, 'r', 0.0),
+                                getattr(b, 'b', 0.0)
+                            ]
+                        if hasattr(prov, 'page_no'):
+                            page_no = prov.page_no
+                    
+                    # Determine segment type from item label
+                    seg_type = "text"
+                    if hasattr(item, 'label'):
+                        label = str(item.label).lower()
+                        if 'title' in label:
+                            seg_type = 'title'
+                        elif 'section' in label or 'header' in label:
+                            seg_type = 'section_header'
+                        elif 'caption' in label:
+                            seg_type = 'caption'
+                        elif 'list' in label:
+                            seg_type = 'list_item'
+                        elif 'footnote' in label:
+                            seg_type = 'footnote'
+                        else:
+                            seg_type = label
+                    
+                    segment = TextSegment(
+                        id=f"txt_{segment_counter}",
+                        type=seg_type,
+                        text=text.strip(),
+                        page_no=page_no,
+                        bbox=bbox,
+                        source_file=pdf_path.name
+                    )
+                    paper_data.text_segments.append(segment)
+                    segment_counter += 1
+            except Exception as e:
+                logger.warning(f"Error extracting text segments: {e}")
         
         return paper_data
     
