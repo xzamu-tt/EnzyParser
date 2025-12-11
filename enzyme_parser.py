@@ -4,13 +4,22 @@ Uses Docling for PDF/document extraction with focus on enzyme research papers.
 """
 
 import os
+import json
 import logging
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import pandas as pd
 from pydantic import BaseModel
 from PIL import Image
+
+# Nuevos imports para Gemini y Env
+from dotenv import load_dotenv
+import google.generativeai as genai
+
+# Cargar variables de entorno
+load_dotenv()
 
 # Docling imports
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -20,12 +29,26 @@ from docling.datamodel.pipeline_options import (
 )
 from docling.datamodel.document import TableItem, PictureItem
 
+# Configurar Gemini si existe la key
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+# logger warning moved to init or main logic to avoid immediate execution side effects if possible, 
+# but user requested "Al inicio del archivo", so placing it here.
+# However, logger is not defined yet. 
+# User snippet has "logger.warning". "logger" relies on basicConfig which is lower down.
+# I will move basicConfig UP or define logger earlier.
+# The user snippet implies imports -> logger config -> gemini config.
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("EnzyParser")
+
+if not GOOGLE_API_KEY:
+    logger.warning("GOOGLE_API_KEY not found in .env. LLM filtering will be disabled.")
 
 
 # --- Pydantic Data Models ---
@@ -40,6 +63,7 @@ class VisualArtifact(BaseModel):
     caption: str
     vlm_description: str  # Preliminary VLM description
     source_file: str
+    has_quantitative_data: Optional[bool] = None  # NUEVO CAMPO
 
 
 class TextSegment(BaseModel):
@@ -50,6 +74,7 @@ class TextSegment(BaseModel):
     page_no: int
     bbox: List[float]  # [left, top, right, bottom]
     source_file: str
+    has_quantitative_data: Optional[bool] = None  # NUEVO CAMPO
 
 
 class PaperData(BaseModel):
@@ -62,6 +87,72 @@ class PaperData(BaseModel):
     artifacts: List[VisualArtifact] = []
     tables_data: List[Dict] = []
     supplementary_files_processed: List[str] = []
+    llm_classification: Optional[Dict[str, Any]] = None  # New field for LLM results
+
+
+class DataClassifier:
+    """
+    Handles interaction with Gemini 1.5 Flash to filter scientific data.
+    """
+    def __init__(self, model_name: str = "gemini-1.5-flash"):
+        self.model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction="""You are an expert Scientific Data Curator specialized in Biochemistry and Enzymology.
+Your task is to analyze content segments (text paragraphs or figure captions) from scientific papers and classify whether they contain QUANTITATIVE EXPERIMENTAL DATA.
+
+Target Data Definition (Look for these):
+- Kinetic parameters: Kcat, Km, Vmax, specific activity (U/mg), turnover rates.
+- Physicochemical properties: Melting temperature (Tm), Glass transition (Tg), Crystallinity (%).
+- Experimental Conditions paired with Results: pH values, Temperatures (°C), Buffer concentrations linked to activity/stability.
+- Quantitative Results: "30% increase", "fold change", "degradation rate", "yield of 50%", "concentration of 100 nM".
+- Statistical markers linked to data: p-values, error margins (± SD/SEM), n=3.
+
+Exclusions (Classify as FALSE):
+- General introductory text or broad claims without numbers ("Enzymes are efficient").
+- Methodology descriptions without results ("We used HPLC to measure...").
+- Citations or references descriptions.
+- Acknowledgments or author affiliations.
+
+Your output must be a strict JSON list classifying each input item.
+Prioritize RECALL: If you are unsure but it looks like a result, classify as TRUE."""
+        )
+        
+        # Configuración de generación para forzar JSON estricto
+        self.generation_config = genai.types.GenerationConfig(
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema=list[dict[str, Any]] # O define un TypedDict más estricto si prefieres
+        )
+
+    def classify_batch(self, items: List[Dict]) -> Dict[str, bool]:
+        """
+        Envía un lote de segmentos al LLM y devuelve un mapa {id: bool}.
+        """
+        if not items:
+            return {}
+
+        try:
+            response = self.model.generate_content(
+                json.dumps(items),
+                generation_config=self.generation_config
+            )
+            
+            # Parsear respuesta
+            results = json.loads(response.text)
+            
+            # Convertir lista de resultados a diccionario {id: bool}
+            # Asume que el modelo devuelve [{"id": "...", "has_quantitative_data": true}, ...]
+            classification_map = {}
+            for res in results:
+                # Manejar posibles variaciones en la key del json
+                is_quantitative = res.get("has_quantitative_data", res.get("contains_quantitative_data", False))
+                classification_map[res.get("id")] = is_quantitative
+                
+            return classification_map
+
+        except Exception as e:
+            logger.error(f"LLM Classification failed: {e}")
+            return {}
 
 
 # --- Main Parser Class ---
@@ -87,6 +178,21 @@ class EnzymeParser:
         self.output_root = Path(output_root)
         self.output_root.mkdir(parents=True, exist_ok=True)
         
+        # Load environment variables
+        load_dotenv()
+        
+        # Configure Gemini
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if api_key:
+            genai.configure(api_key=api_key)
+            self.has_gemini = True
+            self.classifier = DataClassifier()
+            logger.info("Gemini API configured successfully")
+        else:
+            self.has_gemini = False
+            self.classifier = None
+            logger.warning("GOOGLE_API_KEY not found in .env. LLM features disabled.")
+
         # Configure Docling pipeline
         self.pipeline_options = PdfPipelineOptions()
         self.pipeline_options.do_ocr = True
@@ -170,8 +276,23 @@ class EnzymeParser:
             if file_path.name == expected_pdf_name or file_path.name.startswith("."):
                 continue
             self._process_supplementary(file_path, paper_data, artifacts_dir)
+
+        # 3. LLM Filtering / Classification
+        if self.has_gemini and paper_data.text_content:
+            logger.info(f"  -> Running LLM Classification for {paper_id}...")
+            classification = self.filter_paper_with_llm(paper_data.text_content)
+            paper_data.llm_classification = classification
+            
+            # Optional: Log if relevant
+            if classification.get("is_relevant"):
+                logger.info(f"  -> [RELEVANT] {classification.get('reasoning')}")
+            else:
+                logger.info(f"  -> [NOT RELEVANT] {classification.get('reasoning')}")
         
-        # 3. Save JSON output
+        # New Detailed Classification
+        self._classify_content(paper_data)
+        
+        # 4. Save JSON output
         json_path = paper_out_dir / f"{paper_id}_data.json"
         with open(json_path, "w", encoding="utf-8") as f:
             f.write(paper_data.model_dump_json(indent=2))
@@ -481,6 +602,117 @@ class EnzymeParser:
                     ))
             except Exception as e:
                 logger.error(f"Error processing image {file_path.name}: {e}")
+
+    def _classify_content(self, paper_data: PaperData):
+        """Filters text segments and visual artifacts using LLM."""
+        if not self.classifier:
+            logger.info("Skipping LLM classification (No API Key)")
+            return
+
+        logger.info(f"Classifying {len(paper_data.text_segments)} segments and {len(paper_data.artifacts)} artifacts...")
+
+        # 1. Preparar Payload (mezcla de texto e imágenes/captions)
+        # Convertimos objetos a dicts simples para el LLM
+        items_to_classify = []
+        
+        # Filtrar solo tipos relevantes para ahorrar tokens
+        # Ignoramos 'page_footer', 'checkbox', etc.
+        relevant_types = ['text', 'caption', 'section_header', 'list_item', 'table_cell'] 
+        
+        for seg in paper_data.text_segments:
+            if seg.type in relevant_types and len(seg.text) > 20: # Ignorar textos muy cortos
+                items_to_classify.append({
+                    "id": seg.id,
+                    "type": seg.type,
+                    "content": seg.text
+                })
+                
+        for art in paper_data.artifacts:
+            # Para imágenes usamos el caption + descripción VLM si existe
+            content = f"Caption: {art.caption}"
+            if art.vlm_description:
+                content += f" | AI Description: {art.vlm_description}"
+                
+            items_to_classify.append({
+                "id": art.id,
+                "type": art.type,
+                "content": content
+            })
+
+        # 2. Procesar en Batches (Lotes de 50 items para seguridad)
+        BATCH_SIZE = 50
+        classification_results = {}
+        
+        for i in range(0, len(items_to_classify), BATCH_SIZE):
+            batch = items_to_classify[i:i + BATCH_SIZE]
+            logger.info(f"  -> Sending batch {i} to {i+len(batch)} to Gemini...")
+            
+            batch_results = self.classifier.classify_batch(batch)
+            classification_results.update(batch_results)
+            
+            # Pequeña pausa para rate limits si no tienes tier pagado
+            time.sleep(1) 
+
+        # 3. Actualizar los objetos originales con el resultado
+        count_positive = 0
+        
+        for seg in paper_data.text_segments:
+            if seg.id in classification_results:
+                seg.has_quantitative_data = classification_results[seg.id]
+                if seg.has_quantitative_data: count_positive += 1
+            else:
+                seg.has_quantitative_data = False # Default si no se procesó
+
+        for art in paper_data.artifacts:
+            if art.id in classification_results:
+                art.has_quantitative_data = classification_results[art.id]
+                if art.has_quantitative_data: count_positive += 1
+            else:
+                art.has_quantitative_data = False
+
+        logger.info(f"  -> Classification complete. Found {count_positive} items with data.")
+
+    def filter_paper_with_llm(self, text_content: str) -> Dict[str, Any]:
+        """
+        Classifies the paper using Gemini 1.5 Flash to determine relevance to Enzyme Research.
+        """
+        if not self.has_gemini:
+            return {"status": "skipped", "reason": "No API Key"}
+
+        try:
+            # Use Gemini 1.5 Flash
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            
+            # Construct Prompt
+            prompt = """
+            You are an expert scientist assisting in building a database of Enzyme Characterization papers.
+            Analyze the following scientific paper text and output a JSON object with the following fields:
+            
+            {
+                "is_enzyme_paper": boolean,  // true if paper primarily studies enzymes (characterization, discovery, engineering)
+                "enzyme_name": "string or null", // Predicted main enzyme name
+                "organism": "string or null",   // Source organism if applicable
+                "relevance_score": float,       // 0.0 to 1.0
+                "summary": "string"             // 1-sentence summary
+            }
+            
+            Paper Content (Truncated if too long, but Flash handles 1M tokens):
+            """
+            
+            # Add text (Flash supports 1M tokens, but we can limit to first 100k chars for speed if needed)
+            # For now passing full text as Docling markdown is usually reasonable in size.
+            final_prompt = prompt + text_content[:500000] # Safety limit of 500k chars ~120k tokens
+
+            response = model.generate_content(
+                final_prompt,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            
+            return json.loads(response.text)
+
+        except Exception as e:
+            logger.error(f"Gemini processing failed: {e}")
+            return {"status": "error", "message": str(e)}
 
 
 # --- Entry Point ---
