@@ -72,12 +72,17 @@ def merge_and_sort_blocks(data):
 
 # --- COMPONENTES DE UI ---
 
-def render_block(block, idx, pdf_path_str, paper_data, output_dir):
+def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
     """Renderiza una tarjeta individual (Bloque)."""
     
     block_id = block.get("id")
     is_important = block.get("has_quantitative_data", False)
-    is_expanded_context = st.session_state.get(f"expand_{block_id}", False)
+    
+    # Check if this block is in the expanded set
+    if "expanded_ids" not in st.session_state:
+        st.session_state.expanded_ids = set()
+    
+    is_expanded_context = block_id in st.session_state.expanded_ids
     
     if not is_important and not is_expanded_context:
         return
@@ -133,15 +138,84 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir):
                 else:
                     st.markdown(f"<span style='color:grey'>{block['text']}</span>", unsafe_allow_html=True)
 
+        # Context expansion buttons - now functional!
         sc1, sc2 = st.columns(2)
-        if sc1.button("⬆️ Contexto Previo", key=f"prev_{block_id}", help="Mostrar bloque anterior"):
-            st.toast("Funcionalidad de contexto en desarrollo")
-            
-        if sc2.button("⬇️ Contexto Posterior", key=f"next_{block_id}"):
-            st.toast("Funcionalidad de contexto en desarrollo")
+        
+        # Find current index in ordered list
+        try:
+            current_idx = ordered_ids.index(block_id)
+        except ValueError:
+            current_idx = idx
+        
+        # Previous context button
+        if current_idx > 0:
+            prev_id = ordered_ids[current_idx - 1]
+            if sc1.button("⬆️ Contexto Previo", key=f"prev_{block_id}", help="Mostrar bloque anterior"):
+                st.session_state.expanded_ids.add(prev_id)
+                st.rerun()
+        else:
+            sc1.button("⬆️ Contexto Previo", key=f"prev_{block_id}", disabled=True, help="No hay bloque anterior")
+        
+        # Next context button
+        if current_idx < len(ordered_ids) - 1:
+            next_id = ordered_ids[current_idx + 1]
+            if sc2.button("⬇️ Contexto Posterior", key=f"next_{block_id}", help="Mostrar bloque siguiente"):
+                st.session_state.expanded_ids.add(next_id)
+                st.rerun()
+        else:
+            sc2.button("⬇️ Contexto Posterior", key=f"next_{block_id}", disabled=True, help="No hay bloque siguiente")
 
 
-# --- TABS ---
+# --- GUI UTILS ---
+
+import tkinter as tk
+from tkinter import filedialog
+
+def select_folder_native():
+    """Abre un diálogo nativo del sistema para seleccionar carpeta."""
+    try:
+        root = tk.Tk()
+        root.withdraw()  # Ocultar la ventana principal
+        root.wm_attributes('-topmost', 1)  # Traer al frente
+        folder_path = filedialog.askdirectory(master=root)
+        root.destroy()
+        return folder_path
+    except Exception as e:
+        st.error(f"No se pudo abrir el selector de carpetas: {e}")
+        return None
+
+def folder_picker_ui(label: str, default_path: str, key: str) -> str:
+    """Componente UI que usa el selector nativo."""
+    st.markdown(f"**{label}**")
+    
+    col1, col2 = st.columns([0.8, 0.2])
+    
+    # Session state management
+    state_key = f"path_{key}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = str(DEFAULT_INPUT_DIR) if "input" in key else str(DEFAULT_OUTPUT_DIR)
+
+    with col1:
+        # Permite edición manual también
+        new_path = st.text_input(
+            "Ruta",
+            value=st.session_state[state_key],
+            key=f"input_{key}",
+            label_visibility="collapsed"
+        )
+        # Update state if manually changed
+        if new_path != st.session_state[state_key]:
+            st.session_state[state_key] = new_path
+
+    with col2:
+        if st.button("📂 Buscar", key=f"btn_{key}", use_container_width=True):
+            selected = select_folder_native()
+            if selected:
+                st.session_state[state_key] = selected
+                st.rerun()
+
+    return st.session_state[state_key]
+
 
 def tab_execution():
     """Pestaña de Ejecución del Parser."""
@@ -151,18 +225,20 @@ def tab_execution():
     col1, col2 = st.columns(2)
     
     with col1:
-        input_dir = st.text_input(
-            "📂 Carpeta de Entrada (Papers)", 
-            value=str(DEFAULT_INPUT_DIR),
-            help="Carpeta que contiene subcarpetas con PDFs (estructura: FolderName/FolderName.pdf)"
+        input_dir = folder_picker_ui(
+            "📂 Carpeta de Entrada (Papers)",
+            str(DEFAULT_INPUT_DIR),
+            "input"
         )
     
     with col2:
-        output_dir = st.text_input(
-            "💾 Carpeta de Salida (JSONs)", 
-            value=str(DEFAULT_OUTPUT_DIR),
-            help="Carpeta donde se guardarán los JSONs procesados"
+        output_dir = folder_picker_ui(
+            "💾 Carpeta de Salida (JSONs)",
+            str(DEFAULT_OUTPUT_DIR),
+            "output"
         )
+    
+    st.divider()
     
     # Store output dir in session for review tab
     st.session_state.output_dir = output_dir
@@ -257,8 +333,17 @@ def tab_review():
         all_blocks = merge_and_sort_blocks(data)
         pdf_path = data.get("original_pdf")
         
+        # Create ordered list of IDs for context navigation
+        ordered_ids = [b.get("id") for b in all_blocks]
+        
+        # Option to clear expanded context
+        if st.session_state.get("expanded_ids"):
+            if st.button("🔄 Limpiar contexto expandido", help="Ocultar todos los bloques de contexto"):
+                st.session_state.expanded_ids = set()
+                st.rerun()
+        
         for i, block in enumerate(all_blocks):
-            render_block(block, i, pdf_path, data, output_dir)
+            render_block(block, i, pdf_path, data, output_dir, ordered_ids)
 
 
 # --- MAIN APP ---
