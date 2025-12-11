@@ -92,9 +92,9 @@ class PaperData(BaseModel):
 
 class DataClassifier:
     """
-    Handles interaction with Gemini 1.5 Flash to filter scientific data.
+    Handles interaction with Gemini 2.5 Flash Lite to filter scientific data.
     """
-    def __init__(self, model_name: str = "gemini-1.5-flash"):
+    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         self.model = genai.GenerativeModel(
             model_name=model_name,
             system_instruction="""You are an expert Scientific Data Curator specialized in Biochemistry and Enzymology.

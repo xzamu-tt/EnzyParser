@@ -168,11 +168,19 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
 
 # --- GUI UTILS ---
 
-import tkinter as tk
-from tkinter import filedialog
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    HAS_TKINTER = True
+except ImportError:
+    HAS_TKINTER = False
 
 def select_folder_native():
     """Abre un diálogo nativo del sistema para seleccionar carpeta."""
+    if not HAS_TKINTER:
+        st.error("El módulo `tkinter` no está instalado en este sistema. Usa la entrada de texto o instala python-tk.")
+        return None
+        
     try:
         root = tk.Tk()
         root.withdraw()  # Ocultar la ventana principal
