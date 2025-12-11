@@ -240,6 +240,88 @@ class EnzymeParser:
                 self.process_paper_folder(paper_dir)
             except Exception as e:
                 logger.error(f"Error processing {paper_dir.name}: {e}")
+
+    def process_all_streaming(self):
+        """
+        Generator version of process_all for UI integration.
+        Yields log messages as strings for real-time display.
+        """
+        dirs = [d for d in self.input_root.iterdir() if d.is_dir()]
+        yield f"📁 Found {len(dirs)} paper directories to process."
+        
+        for i, paper_dir in enumerate(dirs, 1):
+            yield f"\n--- [{i}/{len(dirs)}] Processing: {paper_dir.name} ---"
+            try:
+                for msg in self._process_paper_folder_streaming(paper_dir):
+                    yield msg
+            except Exception as e:
+                yield f"❌ ERROR processing {paper_dir.name}: {e}"
+        
+        yield "\n✅ All papers processed!"
+
+    def _process_paper_folder_streaming(self, folder_path: Path):
+        """Generator version of process_paper_folder for streaming logs."""
+        paper_id = folder_path.name
+        expected_pdf_name = f"{paper_id}.pdf"
+        main_pdf_path = folder_path / expected_pdf_name
+        
+        if not main_pdf_path.exists():
+            yield f"⚠️ SKIPPING: Main PDF not found at {main_pdf_path}"
+            return
+        
+        # Create output structure
+        paper_out_dir = self.output_root / paper_id
+        artifacts_dir = paper_out_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        
+        yield f"📄 Parsing PDF with Docling..."
+        
+        # 1. Process main PDF
+        paper_data = self._parse_docling(
+            main_pdf_path,
+            paper_id,
+            artifacts_dir,
+            is_main=True
+        )
+        
+        yield f"  ✓ Extracted {len(paper_data.text_segments)} text segments, {len(paper_data.artifacts)} figures"
+        
+        # 2. Process supplementary files
+        supp_count = 0
+        for file_path in folder_path.iterdir():
+            if file_path.name == expected_pdf_name or file_path.name.startswith("."):
+                continue
+            self._process_supplementary(file_path, paper_data, artifacts_dir)
+            supp_count += 1
+        
+        if supp_count > 0:
+            yield f"  ✓ Processed {supp_count} supplementary files"
+
+        # 3. LLM Filtering / Classification
+        if self.has_gemini and paper_data.text_content:
+            yield f"🤖 Running LLM Classification..."
+            classification = self.filter_paper_with_llm(paper_data.text_content)
+            paper_data.llm_classification = classification
+            
+            if classification.get("is_enzyme_paper"):
+                yield f"  ✓ [RELEVANT] Enzyme: {classification.get('enzyme_name', 'Unknown')}"
+            else:
+                yield f"  ⚠️ [NOT RELEVANT] Score: {classification.get('relevance_score', 0)}"
+            
+            # Detailed Classification
+            yield f"🔬 Classifying {len(paper_data.text_segments)} segments..."
+            self._classify_content(paper_data)
+            n_positive = sum(1 for s in paper_data.text_segments if s.has_quantitative_data)
+            yield f"  ✓ Found {n_positive} segments with quantitative data"
+        else:
+            yield "⚠️ Skipping LLM classification (no API key)"
+        
+        # 4. Save JSON output
+        json_path = paper_out_dir / f"{paper_id}_data.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(paper_data.model_dump_json(indent=2))
+        
+        yield f"💾 Saved: {json_path}"
     
     def process_paper_folder(self, folder_path: Path) -> None:
         """
