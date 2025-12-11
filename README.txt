@@ -3,8 +3,14 @@
          Batch Scientific Paper Processor using Docling
 ================================================================================
 
-DESCRIPCIÓN
------------
+DESCRIPCIÓN - ENZYPARSER
+-------------   
+-----
+    -----------
+
+    FLJSDLFKJADSF
+    
+
 EnzyParser es un procesador batch de papers científicos enfocado en 
 investigación enzimática. Utiliza la librería Docling de IBM para extraer
 texto, tablas y figuras de PDFs y archivos suplementarios.
