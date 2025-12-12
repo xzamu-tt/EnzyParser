@@ -117,11 +117,10 @@ Your output must be a strict JSON list classifying each input item.
 Prioritize RECALL: If you are unsure but it looks like a result, classify as TRUE."""
         )
         
-        # Configuración de generación para forzar JSON estricto
+        # Configuración de generación para JSON
         self.generation_config = genai.types.GenerationConfig(
             temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=list[dict[str, Any]] # O define un TypedDict más estricto si prefieres
+            response_mime_type="application/json"
         )
 
     def classify_batch(self, items: List[Dict]) -> Dict[str, bool]:
@@ -138,7 +137,12 @@ Prioritize RECALL: If you are unsure but it looks like a result, classify as TRU
             )
             
             # Parsear respuesta
+            # logger.info(f"LLM Raw Response: {response.text[:200]}...") # DEBUG
             results = json.loads(response.text)
+            
+            # Log first item for structure validation
+            if len(results) > 0:
+                 pass # logger.debug(f"First parsed item: {results[0]}")
             
             # Convertir lista de resultados a diccionario {id: bool}
             # Asume que el modelo devuelve [{"id": "...", "has_quantitative_data": true}, ...]
@@ -762,8 +766,8 @@ class EnzymeParser:
             return {"status": "skipped", "reason": "No API Key"}
 
         try:
-            # Use Gemini 1.5 Flash
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            # Use Gemini 2.5 Flash Lite
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
             
             # Construct Prompt
             prompt = """
@@ -774,14 +778,14 @@ class EnzymeParser:
                 "is_enzyme_paper": boolean,  // true if paper primarily studies enzymes (characterization, discovery, engineering)
                 "enzyme_name": "string or null", // Predicted main enzyme name
                 "organism": "string or null",   // Source organism if applicable
-                "relevance_score": float,       // 0.0 to 1.0
-                "summary": "string"             // 1-sentence summary
+                "relevance_score": float,       // 0.0 to 1.0 relevance to enzyme characterization
+                "summary": "string",            // One sentence summary
+                "reasoning": "string"           // Why it is or isn't relevant
             }
-            
-            Paper Content (Truncated if too long, but Flash handles 1M tokens):
+
+            Text content:
             """
             
-            # Add text (Flash supports 1M tokens, but we can limit to first 100k chars for speed if needed)
             # For now passing full text as Docling markdown is usually reasonable in size.
             final_prompt = prompt + text_content[:500000] # Safety limit of 500k chars ~120k tokens
 
