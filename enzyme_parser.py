@@ -9,6 +9,7 @@ import logging
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import typing_extensions as typing
 
 import pandas as pd
 from pydantic import BaseModel
@@ -90,73 +91,79 @@ class PaperData(BaseModel):
     llm_classification: Optional[Dict[str, Any]] = None  # New field for LLM results
 
 
+# --- Definición de Tipos Optimizada (Schema Estricto y Ligero) ---
+class ClassificationResult(typing.TypedDict):
+    id: str
+    is_data: bool  # Renombrado de 'has_quantitative_data' para ahorrar tokens
+
+
 class DataClassifier:
     """
-    Handles interaction with Gemini 2.5 Flash Lite to filter scientific data.
+    Clasificador Binario Optimizado (Gemini Flash).
+    Estrategia: High Recall, Zero Reasoning, Minimal Tokens.
     """
-    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
+    def __init__(self, model_name: str = "gemini-2.0-flash-lite-preview-02-05"):
         self.model = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction="""You are an expert Scientific Data Curator specialized in Biochemistry and Enzymology.
-Your task is to analyze content segments (text paragraphs or figure captions) from scientific papers and classify whether they contain QUANTITATIVE EXPERIMENTAL DATA.
+            system_instruction="""ROLE: Scientific Data Sieve.
+TASK: Classify text chunks as TRUE if they contain EXPERIMENTAL QUANTITATIVE DATA, or FALSE if not.
 
-Target Data Definition (Look for these):
-- Kinetic parameters: Kcat, Km, Vmax, specific activity (U/mg), turnover rates.
-- Physicochemical properties: Melting temperature (Tm), Glass transition (Tg), Crystallinity (%).
-- Experimental Conditions paired with Results: pH values, Temperatures (°C), Buffer concentrations linked to activity/stability.
-- Quantitative Results: "30% increase", "fold change", "degradation rate", "yield of 50%", "concentration of 100 nM".
-- Statistical markers linked to data: p-values, error margins (± SD/SEM), n=3.
+TRUE CRITERIA (Experimental Measurements):
+- Kinetic/Thermodynamic values (Km, kcat, Vmax, Tm, pH optima).
+- Quantitative results linked to conditions ("Activity increased by 50% at 30°C").
+- Statistical data tied to results (p-values, error bars).
+- Specific yields or degradation rates.
 
-Exclusions (Classify as FALSE):
-- General introductory text or broad claims without numbers ("Enzymes are efficient").
-- Methodology descriptions without results ("We used HPLC to measure...").
-- Citations or references descriptions.
-- Acknowledgments or author affiliations.
+FALSE CRITERIA (Context/Methods):
+- Protocols/Recipes ("Mixed 50mM buffer").
+- Hardware/Software specs.
+- General citations or broad introduction statements.
+- Figure descriptions without explicit values (unless caption contains the data).
 
-Your output must be a strict JSON list classifying each input item.
-Prioritize RECALL: If you are unsure but it looks like a result, classify as TRUE."""
+OUTPUT: Strict JSON list. NO reasoning. NO explanations."""
         )
         
-        # Configuración de generación para JSON
+        # Configuración para salida determinista y limpia
         self.generation_config = genai.types.GenerationConfig(
             temperature=0.0,
-            response_mime_type="application/json"
+            response_mime_type="application/json",
+            response_schema=list[ClassificationResult]
         )
 
     def classify_batch(self, items: List[Dict]) -> Dict[str, bool]:
         """
-        Envía un lote de segmentos al LLM y devuelve un mapa {id: bool}.
+        Procesa lotes minimizando overhead.
         """
         if not items:
             return {}
 
         try:
+            # Minificamos el JSON de entrada para ahorrar tokens de input
+            # Enviamos solo ID y Content, sin claves extrañas
+            minified_items = [{"id": i["id"], "text": i["content"]} for i in items]
+            
             response = self.model.generate_content(
-                json.dumps(items),
+                json.dumps(minified_items),
                 generation_config=self.generation_config
             )
             
-            # Parsear respuesta
-            # logger.info(f"LLM Raw Response: {response.text[:200]}...") # DEBUG
             results = json.loads(response.text)
             
-            # Log first item for structure validation
-            if len(results) > 0:
-                 pass # logger.debug(f"First parsed item: {results[0]}")
-            
-            # Convertir lista de resultados a diccionario {id: bool}
-            # Asume que el modelo devuelve [{"id": "...", "has_quantitative_data": true}, ...]
             classification_map = {}
             for res in results:
-                # Manejar posibles variaciones en la key del json
-                is_quantitative = res.get("has_quantitative_data", res.get("contains_quantitative_data", False))
-                classification_map[res.get("id")] = is_quantitative
+                # Mapeamos la respuesta corta 'is_data' a la lógica interna
+                item_id = res.get("id")
+                is_quantitative = res.get("is_data", False)
                 
+                if item_id:
+                    classification_map[item_id] = is_quantitative
+            
             return classification_map
 
         except Exception as e:
-            logger.error(f"LLM Classification failed: {e}")
-            return {}
+            logger.error(f"❌ Batch Error: {e}")
+            # Fallback seguro: Si falla, asumimos True para revisión manual (High Recall)
+            return {item["id"]: True for item in items}
 
 
 # --- Main Parser Class ---
@@ -245,26 +252,36 @@ class EnzymeParser:
             except Exception as e:
                 logger.error(f"Error processing {paper_dir.name}: {e}")
 
-    def process_all_streaming(self):
+    def process_all_streaming(self, skip_llm: bool = False):
         """
         Generator version of process_all for UI integration.
         Yields log messages as strings for real-time display.
+        
+        Args:
+            skip_llm: If True, skip LLM classification (Stage 1 mode)
         """
         dirs = [d for d in self.input_root.iterdir() if d.is_dir()]
-        yield f"📁 Found {len(dirs)} paper directories to process."
+        mode_label = "(Docling Only - No LLM)" if skip_llm else "(Full Processing)"
+        yield f"📁 Found {len(dirs)} paper directories to process. {mode_label}"
         
         for i, paper_dir in enumerate(dirs, 1):
             yield f"\n--- [{i}/{len(dirs)}] Processing: {paper_dir.name} ---"
             try:
-                for msg in self._process_paper_folder_streaming(paper_dir):
+                for msg in self._process_paper_folder_streaming(paper_dir, skip_llm=skip_llm):
                     yield msg
             except Exception as e:
                 yield f"❌ ERROR processing {paper_dir.name}: {e}"
         
         yield "\n✅ All papers processed!"
 
-    def _process_paper_folder_streaming(self, folder_path: Path):
-        """Generator version of process_paper_folder for streaming logs."""
+    def _process_paper_folder_streaming(self, folder_path: Path, skip_llm: bool = False):
+        """
+        Generator version of process_paper_folder for streaming logs.
+        
+        Args:
+            folder_path: Path to paper folder
+            skip_llm: If True, skip LLM classification (Stage 1 mode)
+        """
         paper_id = folder_path.name
         expected_pdf_name = f"{paper_id}.pdf"
         main_pdf_path = folder_path / expected_pdf_name
@@ -301,8 +318,10 @@ class EnzymeParser:
         if supp_count > 0:
             yield f"  ✓ Processed {supp_count} supplementary files"
 
-        # 3. LLM Filtering / Classification
-        if self.has_gemini and paper_data.text_content:
+        # 3. LLM Filtering / Classification (SKIP IF skip_llm=True)
+        if skip_llm:
+            yield "⏭️ Skipping LLM classification (Stage 1 mode)"
+        elif self.has_gemini and paper_data.text_content:
             yield f"🤖 Running LLM Classification..."
             classification = self.filter_paper_with_llm(paper_data.text_content)
             paper_data.llm_classification = classification
@@ -326,6 +345,79 @@ class EnzymeParser:
             f.write(paper_data.model_dump_json(indent=2))
         
         yield f"💾 Saved: {json_path}"
+    
+    def classify_existing_papers_streaming(self):
+        """
+        Stage 2: Run LLM classification on already-parsed JSON files.
+        Iterates over output directory and classifies papers that haven't been classified yet.
+        """
+        if not self.has_gemini:
+            yield "❌ Cannot run LLM classification: No GOOGLE_API_KEY configured"
+            return
+        
+        # Find all paper directories in output
+        paper_dirs = [d for d in self.output_root.iterdir() if d.is_dir()]
+        yield f"📁 Found {len(paper_dirs)} paper directories in output folder."
+        
+        classified_count = 0
+        skipped_count = 0
+        
+        for i, paper_dir in enumerate(paper_dirs, 1):
+            paper_id = paper_dir.name
+            json_path = paper_dir / f"{paper_id}_data.json"
+            
+            if not json_path.exists():
+                yield f"⚠️ [{i}/{len(paper_dirs)}] {paper_id}: No JSON file found, skipping"
+                skipped_count += 1
+                continue
+            
+            yield f"\n--- [{i}/{len(paper_dirs)}] Classifying: {paper_id} ---"
+            
+            try:
+                # Load existing paper data
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                paper_data = PaperData(**data)
+                
+                # Check if already classified
+                already_classified = any(
+                    s.has_quantitative_data is not None 
+                    for s in paper_data.text_segments
+                )
+                
+                if already_classified:
+                    n_positive = sum(1 for s in paper_data.text_segments if s.has_quantitative_data)
+                    yield f"  ⚠️ Already classified ({n_positive} positive segments). Re-classifying..."
+                
+                # Run paper-level classification
+                if paper_data.text_content:
+                    yield f"🤖 Running paper-level classification..."
+                    classification = self.filter_paper_with_llm(paper_data.text_content)
+                    paper_data.llm_classification = classification
+                    
+                    if classification.get("is_enzyme_paper"):
+                        yield f"  ✓ [RELEVANT] Enzyme: {classification.get('enzyme_name', 'Unknown')}"
+                    else:
+                        yield f"  ⚠️ [NOT RELEVANT] Score: {classification.get('relevance_score', 0)}"
+                
+                # Run segment-level classification
+                yield f"🔬 Classifying {len(paper_data.text_segments)} segments..."
+                self._classify_content(paper_data)
+                n_positive = sum(1 for s in paper_data.text_segments if s.has_quantitative_data)
+                yield f"  ✓ Found {n_positive} segments with quantitative data"
+                
+                # Save updated JSON
+                with open(json_path, "w", encoding="utf-8") as f:
+                    f.write(paper_data.model_dump_json(indent=2))
+                
+                yield f"💾 Saved: {json_path}"
+                classified_count += 1
+                
+            except Exception as e:
+                yield f"❌ Error classifying {paper_id}: {e}"
+        
+        yield f"\n✅ Classification complete! Classified: {classified_count}, Skipped: {skipped_count}"
     
     def process_paper_folder(self, folder_path: Path) -> None:
         """
@@ -473,6 +565,65 @@ class EnzymeParser:
         
         return base_caption
     
+    def _find_table_caption(self, table, doc, tolerance: float = 100.0) -> str:
+        """
+        Busca leyendas de tablas mirando FÍSICAMENTE ARRIBA del elemento.
+        En papers científicos, el título de la tabla casi siempre precede a la tabla.
+        """
+        # Intento 1: Docling nativo (a veces acierta)
+        base_caption = ""
+        if hasattr(table, 'caption_text'):
+            try:
+                base_caption = table.caption_text(doc) or ""
+            except:
+                pass
+        
+        # Si Docling ya lo encontró y es largo, confiamos.
+        if len(base_caption) > 20:
+            return base_caption
+
+        # Intento 2: Búsqueda Geométrica Inversa (Look Upwards)
+        extended_text = []
+        
+        if not table.prov:
+            return base_caption
+        
+        tab_prov = table.prov[0]
+        tab_page = tab_prov.page_no
+        tab_top = getattr(tab_prov.bbox, 't', 0.0)  # El borde SUPERIOR de la tabla
+        
+        try:
+            # Iteramos items de la misma página
+            for item, level in doc.iterate_items():
+                if isinstance(item, (TableItem, PictureItem)):
+                    continue
+                if not hasattr(item, 'prov') or not item.prov:
+                    continue
+                
+                item_prov = item.prov[0]
+                if item_prov.page_no != tab_page:
+                    continue
+                
+                # Coordenadas del texto candidato
+                text_bottom = getattr(item_prov.bbox, 'b', 0.0)
+                
+                # LÓGICA: El texto debe estar ARRIBA de la tabla
+                # En coordenadas top-left (Y crece hacia abajo):
+                # El bottom del texto debe ser menor que el top de la tabla
+                distance = tab_top - text_bottom
+                
+                # Si está cerca (0 a 100px encima)
+                if 0 < distance < tolerance:
+                    text = getattr(item, 'text', '').strip()
+                    if text:
+                        # Heurística extra: Si empieza con "Table", es el ganador seguro.
+                        if text.lower().startswith("table") or len(text) > 10:
+                            extended_text.append(text)
+        except Exception as e:
+            logger.warning(f"Error finding table caption: {e}")
+
+        return " ".join(extended_text) if extended_text else base_caption
+    
     def _parse_docling(
         self,
         pdf_path: Path,
@@ -553,32 +704,79 @@ class EnzymeParser:
         
         # Extract tables
         if hasattr(doc, 'tables'):
-            for table in doc.tables:
+            for i, table in enumerate(doc.tables):
                 try:
                     if hasattr(table, 'export_to_dataframe'):
-                        df = table.export_to_dataframe()
+                        df = table.export_to_dataframe(doc)  # Pasamos 'doc' para evitar warning
+                        
+                        # --- CORRECCIÓN CRÍTICA ---
+                        # 1. Buscamos el título ARRIBA de la tabla
+                        caption = self._find_table_caption(table, doc)
+                        
                         page_no = table.prov[0].page_no if table.prov else 0
+                        
+                        # 2. Guardamos con estructura rica e ID
                         paper_data.tables_data.append({
+                            "id": f"tbl_{i}",  # ID único para referenciar
+                            "type": "table",   # Para diferenciar en la UI
                             "source": pdf_path.name,
                             "page": page_no,
-                            "data": df.to_dict(orient="records")
+                            "caption": caption,
+                            "data": df.to_dict(orient="records"),
+                            "has_quantitative_data": True  # Asumir relevancia por defecto
                         })
                 except Exception as e:
                     logger.warning(f"Error extracting table: {e}")
         
-        # Extract text segments with layout grounding
+        # Extract text segments with layout grounding and PRE-FILTERING
         if hasattr(doc, 'iterate_items'):
             segment_counter = 0
+            
+            # DEFINIR TIPOS A IGNORAR TOTALMENTE (ruido estructural)
+            IGNORED_LABELS = {'page_header', 'page_footer', 'footnote', 'reference'}
+            
             try:
                 for item, level in doc.iterate_items():
-                    # Skip tables and pictures (handled separately)
+                    # 1. Filtro Básico de Tipo (tablas y figuras se manejan aparte)
                     if isinstance(item, (TableItem, PictureItem)):
                         continue
                     
-                    # Get text content
-                    text = getattr(item, 'text', None)
-                    if not text or not text.strip():
+                    # Obtener etiqueta original de Docling
+                    docling_label = str(getattr(item, 'label', 'text')).lower()
+                    
+                    # 2. Filtro de Ruido Estructural (Headers/Footers/Footnotes)
+                    if docling_label in IGNORED_LABELS:
                         continue
+                    
+                    # Obtener texto limpio
+                    text = getattr(item, 'text', '')
+                    if not text:
+                        continue
+                    text = text.strip()
+                    
+                    if not text:
+                        continue
+                    
+                    # 3. Filtro de URLs y DOIs (siempre basura para extracción científica)
+                    if "http" in text.lower() or "www." in text.lower() or "doi.org" in text.lower():
+                        continue
+                    
+                    # 4. Filtro de Longitud (Heurística de Ruido MEJORADA)
+                    # Si es texto plano y muy corto (<40 chars), suele ser basura visual
+                    # PERO salvamos: Títulos, Headers, Captions, y texto que parece caption
+                    
+                    # --- CORRECCIÓN: Definir qué es "Sagrado" ---
+                    is_title = 'title' in docling_label
+                    is_header = 'header' in docling_label or 'heading' in docling_label
+                    is_caption = 'caption' in docling_label  # <--- IMPORTANTE
+                    
+                    # El texto que empieza con "Table" o "Figure" se salva aunque Docling lo etiquete mal
+                    looks_like_caption = text.lower().startswith("table") or text.lower().startswith("fig")
+                    
+                    # Solo borramos si es corto Y NO es nada importante
+                    if len(text) < 40:
+                        if not (is_title or is_header or is_caption or looks_like_caption):
+                            continue
                     
                     # Get provenance (coordinates)
                     bbox = [0.0, 0.0, 0.0, 0.0]
@@ -596,27 +794,23 @@ class EnzymeParser:
                         if hasattr(prov, 'page_no'):
                             page_no = prov.page_no
                     
-                    # Determine segment type from item label
+                    # Normalizar etiquetas para nuestro sistema
                     seg_type = "text"
-                    if hasattr(item, 'label'):
-                        label = str(item.label).lower()
-                        if 'title' in label:
-                            seg_type = 'title'
-                        elif 'section' in label or 'header' in label:
-                            seg_type = 'section_header'
-                        elif 'caption' in label:
-                            seg_type = 'caption'
-                        elif 'list' in label:
-                            seg_type = 'list_item'
-                        elif 'footnote' in label:
-                            seg_type = 'footnote'
-                        else:
-                            seg_type = label
+                    if 'title' in docling_label:
+                        seg_type = 'title'
+                    elif 'section' in docling_label or 'header' in docling_label or 'heading' in docling_label:
+                        seg_type = 'section_header'
+                    elif 'caption' in docling_label:
+                        seg_type = 'caption'
+                    elif 'list' in docling_label:
+                        seg_type = 'list_item'
+                    else:
+                        seg_type = 'text'  # Default to 'text' for cleaner output
                     
                     segment = TextSegment(
                         id=f"txt_{segment_counter}",
                         type=seg_type,
-                        text=text.strip(),
+                        text=text,
                         page_no=page_no,
                         bbox=bbox,
                         source_file=pdf_path.name

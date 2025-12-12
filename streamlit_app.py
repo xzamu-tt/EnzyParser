@@ -98,25 +98,25 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
 
         with c2:
             if not is_important:
-                if st.button("📌 Marcar Útil", key=f"mark_{block_id}"):
+                if st.button("📌 Marcar Útil", key=f"mark_{idx}_{block_id}"):
                     block["has_quantitative_data"] = True
                     save_paper_data(output_dir, st.session_state.selected_paper_id, paper_data)
                     st.rerun()
             else:
-                if st.button("🗑️ Descartar", key=f"unmark_{block_id}"):
+                if st.button("🗑️ Descartar", key=f"unmark_{idx}_{block_id}"):
                     block["has_quantitative_data"] = False
                     save_paper_data(output_dir, st.session_state.selected_paper_id, paper_data)
                     st.rerun()
 
         with c3:
-            view_mode = st.toggle("Ver Original", key=f"view_{block_id}")
+            view_mode = st.toggle("Ver Original", key=f"view_{idx}_{block_id}")
 
         if block["block_type"] == "artifact":
             rel_path = block.get("file_path")
             abs_path = Path(os.getcwd()) / rel_path 
             
             if abs_path.exists():
-                st.image(str(abs_path), caption=block.get("caption", "Figura"), use_container_width=True)
+                st.image(str(abs_path), caption=block.get("caption", "Figura"), width="stretch")
                 if block.get("vlm_description"):
                     with st.expander("Análisis IA"):
                         st.write(block["vlm_description"])
@@ -150,20 +150,20 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
         # Previous context button
         if current_idx > 0:
             prev_id = ordered_ids[current_idx - 1]
-            if sc1.button("⬆️ Contexto Previo", key=f"prev_{block_id}", help="Mostrar bloque anterior"):
+            if sc1.button("⬆️ Contexto Previo", key=f"prev_{idx}_{block_id}", help="Mostrar bloque anterior"):
                 st.session_state.expanded_ids.add(prev_id)
                 st.rerun()
         else:
-            sc1.button("⬆️ Contexto Previo", key=f"prev_{block_id}", disabled=True, help="No hay bloque anterior")
+            sc1.button("⬆️ Contexto Previo", key=f"prev_{idx}_{block_id}", disabled=True, help="No hay bloque anterior")
         
         # Next context button
         if current_idx < len(ordered_ids) - 1:
             next_id = ordered_ids[current_idx + 1]
-            if sc2.button("⬇️ Contexto Posterior", key=f"next_{block_id}", help="Mostrar bloque siguiente"):
+            if sc2.button("⬇️ Contexto Posterior", key=f"next_{idx}_{block_id}", help="Mostrar bloque siguiente"):
                 st.session_state.expanded_ids.add(next_id)
                 st.rerun()
         else:
-            sc2.button("⬇️ Contexto Posterior", key=f"next_{block_id}", disabled=True, help="No hay bloque siguiente")
+            sc2.button("⬇️ Contexto Posterior", key=f"next_{idx}_{block_id}", disabled=True, help="No hay bloque siguiente")
 
 
 # --- GUI UTILS ---
@@ -260,35 +260,105 @@ def tab_execution():
     subdirs = [d for d in input_path.iterdir() if d.is_dir()]
     st.info(f"📁 Encontrados {len(subdirs)} subdirectorios en la carpeta de entrada.")
     
-    # Run Button
-    if st.button("▶️ Iniciar Procesamiento", type="primary", use_container_width=True):
-        
-        # Import parser here to avoid circular imports
+    # --- STAGE SELECTION: Two-Stage Processing ---
+    st.subheader("Procesamiento en Dos Etapas")
+    
+    # --- STAGE 1: Docling Extraction ---
+    st.markdown("### ⚙️ Etapa 1: Extracción con Docling")
+    st.caption("Parsea PDFs, extrae texto/figuras/tablas. **No usa LLM.**")
+    
+    # Mode selection for Stage 1
+    mode = st.radio(
+        "Modo de extracción:",
+        ["📦 Todos los Artículos", "📄 Un Solo Artículo"],
+        horizontal=True,
+        key="stage1_mode"
+    )
+    
+    selected_folder = None
+    if mode == "📄 Un Solo Artículo":
+        if not subdirs:
+            st.warning("No hay subdirectorios para procesar.")
+        else:
+            folder_names = sorted([d.name for d in subdirs])
+            selected_folder = st.selectbox(
+                "Selecciona el artículo:",
+                folder_names,
+                key="single_folder_select"
+            )
+    
+    if st.button("▶️ Ejecutar Extracción (Sin LLM)", type="secondary", use_container_width=True):
         try:
             from enzyme_parser import EnzymeParser
         except ImportError:
-            st.error("❌ No se pudo importar EnzymeParser. Asegúrate de que enzyme_parser.py está en el mismo directorio.")
+            st.error("❌ No se pudo importar EnzymeParser.")
             return
         
-        # Create log container
         log_container = st.empty()
         logs = []
         
-        with st.spinner("Procesando..."):
+        with st.spinner("Extrayendo con Docling..."):
             try:
                 parser = EnzymeParser(input_dir, output_dir)
                 
-                # Stream logs
-                for msg in parser.process_all_streaming():
-                    logs.append(msg)
-                    # Update display with all logs
+                if selected_folder:
+                    folder_path = input_path / selected_folder
+                    logs.append(f"🔬 Extrayendo artículo: {selected_folder}")
                     log_container.code("\n".join(logs), language="")
                     
-                st.success("✅ Procesamiento completado!")
+                    for msg in parser._process_paper_folder_streaming(folder_path, skip_llm=True):
+                        logs.append(msg)
+                        log_container.code("\n".join(logs), language="")
+                else:
+                    for msg in parser.process_all_streaming(skip_llm=True):
+                        logs.append(msg)
+                        log_container.code("\n".join(logs), language="")
+                
+                st.success("✅ Extracción completada! Revisa los JSONs antes de clasificar.")
+                
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+    
+    st.divider()
+    
+    # --- STAGE 2: LLM Classification ---
+    st.markdown("### 🧠 Etapa 2: Clasificación con LLM")
+    st.caption("Ejecuta el clasificador LLM sobre JSONs existentes en la carpeta de salida.")
+    
+    # Count papers in output
+    output_path = Path(output_dir)
+    if output_path.exists():
+        paper_dirs = [d for d in output_path.iterdir() if d.is_dir()]
+        st.info(f"📁 {len(paper_dirs)} papers encontrados en carpeta de salida")
+    else:
+        st.warning("La carpeta de salida no existe.")
+        paper_dirs = []
+    
+    if st.button("▶️ Ejecutar Clasificación LLM", type="primary", use_container_width=True, disabled=len(paper_dirs) == 0):
+        try:
+            from enzyme_parser import EnzymeParser
+        except ImportError:
+            st.error("❌ No se pudo importar EnzymeParser.")
+            return
+        
+        log_container = st.empty()
+        logs = []
+        
+        with st.spinner("Clasificando con LLM..."):
+            try:
+                parser = EnzymeParser(input_dir, output_dir)
+                
+                for msg in parser.classify_existing_papers_streaming():
+                    logs.append(msg)
+                    log_container.code("\n".join(logs), language="")
+                
+                st.success("✅ Clasificación completada!")
                 st.balloons()
                 
             except Exception as e:
-                st.error(f"❌ Error durante el procesamiento: {e}")
+                st.error(f"❌ Error: {e}")
                 import traceback
                 st.code(traceback.format_exc())
 
