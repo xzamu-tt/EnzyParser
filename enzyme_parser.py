@@ -252,46 +252,57 @@ class EnzymeParser:
             except Exception as e:
                 logger.error(f"Error processing {paper_dir.name}: {e}")
 
-    def process_all_streaming(self, skip_llm: bool = False):
+    def process_all_streaming(self, skip_llm: bool = False, force_rerun: bool = False):
         """
         Generator version of process_all for UI integration.
         Yields log messages as strings for real-time display.
         
         Args:
             skip_llm: If True, skip LLM classification (Stage 1 mode)
+            force_rerun: If True, reprocess even if output already exists
         """
         dirs = [d for d in self.input_root.iterdir() if d.is_dir()]
         mode_label = "(Docling Only - No LLM)" if skip_llm else "(Full Processing)"
-        yield f"📁 Found {len(dirs)} paper directories to process. {mode_label}"
+        rerun_label = "[FORCE RERUN]" if force_rerun else ""
+        yield f"📁 Found {len(dirs)} paper directories to process. {mode_label} {rerun_label}"
         
         for i, paper_dir in enumerate(dirs, 1):
             yield f"\n--- [{i}/{len(dirs)}] Processing: {paper_dir.name} ---"
             try:
-                for msg in self._process_paper_folder_streaming(paper_dir, skip_llm=skip_llm):
+                for msg in self._process_paper_folder_streaming(paper_dir, skip_llm=skip_llm, force_rerun=force_rerun):
                     yield msg
             except Exception as e:
                 yield f"❌ ERROR processing {paper_dir.name}: {e}"
         
         yield "\n✅ All papers processed!"
 
-    def _process_paper_folder_streaming(self, folder_path: Path, skip_llm: bool = False):
+    def _process_paper_folder_streaming(self, folder_path: Path, skip_llm: bool = False, force_rerun: bool = False):
         """
         Generator version of process_paper_folder for streaming logs.
         
         Args:
             folder_path: Path to paper folder
             skip_llm: If True, skip LLM classification (Stage 1 mode)
+            force_rerun: If True, reprocess even if output already exists
         """
         paper_id = folder_path.name
         expected_pdf_name = f"{paper_id}.pdf"
         main_pdf_path = folder_path / expected_pdf_name
+        
+        # Setup output paths
+        paper_out_dir = self.output_root / paper_id
+        json_path = paper_out_dir / f"{paper_id}_data.json"
+        
+        # --- CHECK DE IDEMPOTENCIA ---
+        if json_path.exists() and not force_rerun:
+            yield f"⏭️ SKIPPING {paper_id}: Output already exists. Use force_rerun to reprocess."
+            return
         
         if not main_pdf_path.exists():
             yield f"⚠️ SKIPPING: Main PDF not found at {main_pdf_path}"
             return
         
         # Create output structure
-        paper_out_dir = self.output_root / paper_id
         artifacts_dir = paper_out_dir / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         
@@ -565,12 +576,14 @@ class EnzymeParser:
         
         return base_caption
     
-    def _find_table_caption(self, table, doc, tolerance: float = 100.0) -> str:
+    def _find_table_context(self, table, doc, tolerance_up: float = 100.0, tolerance_down: float = 80.0) -> Dict[str, str]:
         """
-        Busca leyendas de tablas mirando FÍSICAMENTE ARRIBA del elemento.
-        En papers científicos, el título de la tabla casi siempre precede a la tabla.
+        Busca el 'Sandwich' de la tabla: Título arriba y Notas abajo.
+        Retorna un dict con {'caption': str, 'notes': str}
         """
-        # Intento 1: Docling nativo (a veces acierta)
+        context = {"caption": "", "notes": ""}
+        
+        # 1. Caption (Nativo o Búsqueda Arriba)
         base_caption = ""
         if hasattr(table, 'caption_text'):
             try:
@@ -578,51 +591,70 @@ class EnzymeParser:
             except:
                 pass
         
-        # Si Docling ya lo encontró y es largo, confiamos.
         if len(base_caption) > 20:
-            return base_caption
+            context["caption"] = base_caption
+        elif table.prov:
+            # Búsqueda manual hacia arriba
+            tab_prov = table.prov[0]
+            tab_top = getattr(tab_prov.bbox, 't', 0.0)
+            tab_page = tab_prov.page_no
+            candidates_up = []
+            
+            try:
+                for item, _ in doc.iterate_items():
+                    if isinstance(item, (TableItem, PictureItem)):
+                        continue
+                    if not item.prov or item.prov[0].page_no != tab_page:
+                        continue
+                    
+                    text_bottom = getattr(item.prov[0].bbox, 'b', 0.0)
+                    dist_up = tab_top - text_bottom
+                    
+                    if 0 < dist_up < tolerance_up:
+                        text = getattr(item, 'text', '').strip()
+                        if text and (text.lower().startswith("table") or len(text) > 10):
+                            candidates_up.append(text)
+            except Exception as e:
+                logger.warning(f"Error finding table caption: {e}")
+            
+            # El título suele ser el último candidato (más cercano a la tabla)
+            if candidates_up:
+                context["caption"] = candidates_up[-1]
 
-        # Intento 2: Búsqueda Geométrica Inversa (Look Upwards)
-        extended_text = []
-        
-        if not table.prov:
-            return base_caption
-        
-        tab_prov = table.prov[0]
-        tab_page = tab_prov.page_no
-        tab_top = getattr(tab_prov.bbox, 't', 0.0)  # El borde SUPERIOR de la tabla
-        
-        try:
-            # Iteramos items de la misma página
-            for item, level in doc.iterate_items():
-                if isinstance(item, (TableItem, PictureItem)):
-                    continue
-                if not hasattr(item, 'prov') or not item.prov:
-                    continue
-                
-                item_prov = item.prov[0]
-                if item_prov.page_no != tab_page:
-                    continue
-                
-                # Coordenadas del texto candidato
-                text_bottom = getattr(item_prov.bbox, 'b', 0.0)
-                
-                # LÓGICA: El texto debe estar ARRIBA de la tabla
-                # En coordenadas top-left (Y crece hacia abajo):
-                # El bottom del texto debe ser menor que el top de la tabla
-                distance = tab_top - text_bottom
-                
-                # Si está cerca (0 a 100px encima)
-                if 0 < distance < tolerance:
-                    text = getattr(item, 'text', '').strip()
-                    if text:
-                        # Heurística extra: Si empieza con "Table", es el ganador seguro.
-                        if text.lower().startswith("table") or len(text) > 10:
-                            extended_text.append(text)
-        except Exception as e:
-            logger.warning(f"Error finding table caption: {e}")
+        # 2. Notas al pie (Búsqueda Abajo)
+        if table.prov:
+            tab_bottom = getattr(table.prov[0].bbox, 'b', 0.0)
+            tab_page = table.prov[0].page_no
+            candidates_down = []
+            
+            try:
+                for item, _ in doc.iterate_items():
+                    if isinstance(item, (TableItem, PictureItem)):
+                        continue
+                    if not item.prov or item.prov[0].page_no != tab_page:
+                        continue
+                    
+                    text_top = getattr(item.prov[0].bbox, 't', 0.0)
+                    dist_down = text_top - tab_bottom
+                    
+                    # Buscamos texto inmediatamente abajo
+                    if 0 < dist_down < tolerance_down:
+                        text = getattr(item, 'text', '').strip()
+                        # Heurísticas para notas al pie
+                        is_note = (
+                            text.startswith("*") or 
+                            text.lower().startswith("note") or 
+                            text.lower().startswith("abbreviation") or 
+                            len(text) < 150
+                        )
+                        if text and is_note:
+                            candidates_down.append(text)
+            except Exception as e:
+                logger.warning(f"Error finding table notes: {e}")
+            
+            context["notes"] = " ".join(candidates_down)
 
-        return " ".join(extended_text) if extended_text else base_caption
+        return context
     
     def _parse_docling(
         self,
@@ -707,26 +739,38 @@ class EnzymeParser:
             for i, table in enumerate(doc.tables):
                 try:
                     if hasattr(table, 'export_to_dataframe'):
-                        df = table.export_to_dataframe(doc)  # Pasamos 'doc' para evitar warning
+                        df = table.export_to_dataframe(doc)
                         
-                        # --- CORRECCIÓN CRÍTICA ---
-                        # 1. Buscamos el título ARRIBA de la tabla
-                        caption = self._find_table_caption(table, doc)
+                        # --- CONTEXTO RICO: Título + Notas ---
+                        ctx = self._find_table_context(table, doc)
                         
                         page_no = table.prov[0].page_no if table.prov else 0
                         
-                        # 2. Guardamos con estructura rica e ID
+                        # Calcular BBox para UI
+                        bbox = [0.0, 0.0, 0.0, 0.0]
+                        if table.prov:
+                            b = table.prov[0].bbox
+                            bbox = [
+                                getattr(b, 'l', 0.0),
+                                getattr(b, 't', 0.0),
+                                getattr(b, 'r', 0.0),
+                                getattr(b, 'b', 0.0)
+                            ]
+                        
+                        # Guardar con estructura rica e ID
                         paper_data.tables_data.append({
-                            "id": f"tbl_{i}",  # ID único para referenciar
-                            "type": "table",   # Para diferenciar en la UI
+                            "id": f"tbl_{i}",
+                            "type": "table",
                             "source": pdf_path.name,
                             "page": page_no,
-                            "caption": caption,
+                            "bbox": bbox,
+                            "caption": ctx["caption"],
+                            "table_notes": ctx["notes"],  # Notas al pie (*p<0.05, etc.)
                             "data": df.to_dict(orient="records"),
-                            "has_quantitative_data": True  # Asumir relevancia por defecto
+                            "has_quantitative_data": True
                         })
                 except Exception as e:
-                    logger.warning(f"Error extracting table: {e}")
+                    logger.warning(f"Error extracting table {i}: {e}")
         
         # Extract text segments with layout grounding and PRE-FILTERING
         if hasattr(doc, 'iterate_items'):

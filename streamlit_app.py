@@ -287,6 +287,9 @@ def tab_execution():
                 key="single_folder_select"
             )
     
+    # Force rerun option
+    force_rerun = st.checkbox("🔄 Forzar re-procesamiento (Sobreescribir existentes)", value=False)
+    
     if st.button("▶️ Ejecutar Extracción (Sin LLM)", type="secondary", use_container_width=True):
         try:
             from enzyme_parser import EnzymeParser
@@ -306,11 +309,11 @@ def tab_execution():
                     logs.append(f"🔬 Extrayendo artículo: {selected_folder}")
                     log_container.code("\n".join(logs), language="")
                     
-                    for msg in parser._process_paper_folder_streaming(folder_path, skip_llm=True):
+                    for msg in parser._process_paper_folder_streaming(folder_path, skip_llm=True, force_rerun=force_rerun):
                         logs.append(msg)
                         log_container.code("\n".join(logs), language="")
                 else:
-                    for msg in parser.process_all_streaming(skip_llm=True):
+                    for msg in parser.process_all_streaming(skip_llm=True, force_rerun=force_rerun):
                         logs.append(msg)
                         log_container.code("\n".join(logs), language="")
                 
