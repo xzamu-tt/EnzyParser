@@ -14,6 +14,7 @@ import typing_extensions as typing
 import pandas as pd
 from pydantic import BaseModel
 from PIL import Image
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Nuevos imports para Gemini y Env
 from dotenv import load_dotenv
@@ -32,6 +33,7 @@ from docling.datamodel.document import TableItem, PictureItem
 
 # Configurar Gemini si existe la key
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DEFAULT_LLM_MODEL = "gemini-2.5-flash-lite"  # Single source of truth for model name
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 # logger warning moved to init or main logic to avoid immediate execution side effects if possible, 
@@ -91,79 +93,54 @@ class PaperData(BaseModel):
     llm_classification: Optional[Dict[str, Any]] = None  # New field for LLM results
 
 
-# --- Definición de Tipos Optimizada (Schema Estricto y Ligero) ---
+# --- Definición de Tipos para Schema Estricto (Sin Reasoning) ---
 class ClassificationResult(typing.TypedDict):
     id: str
-    is_data: bool  # Renombrado de 'has_quantitative_data' para ahorrar tokens
-
+    is_data: bool
 
 class DataClassifier:
     """
-    Clasificador Binario Optimizado (Gemini Flash).
-    Estrategia: High Recall, Zero Reasoning, Minimal Tokens.
+    Clasificador pragmático. 
+    Estrategia: Lo que el modelo no confirme como FALSE, será TRUE.
     """
-    def __init__(self, model_name: str = "gemini-2.0-flash-lite-preview-02-05"):
+    def __init__(self, model_name: str = DEFAULT_LLM_MODEL):
         self.model = genai.GenerativeModel(
             model_name=model_name,
-            system_instruction="""ROLE: Scientific Data Sieve.
-TASK: Classify text chunks as TRUE if they contain EXPERIMENTAL QUANTITATIVE DATA, or FALSE if not.
-
-TRUE CRITERIA (Experimental Measurements):
-- Kinetic/Thermodynamic values (Km, kcat, Vmax, Tm, pH optima).
-- Quantitative results linked to conditions ("Activity increased by 50% at 30°C").
-- Statistical data tied to results (p-values, error bars).
-- Specific yields or degradation rates.
-
-FALSE CRITERIA (Context/Methods):
-- Protocols/Recipes ("Mixed 50mM buffer").
-- Hardware/Software specs.
-- General citations or broad introduction statements.
-- Figure descriptions without explicit values (unless caption contains the data).
-
-OUTPUT: Strict JSON list. NO reasoning. NO explanations."""
+            system_instruction="""TASK: Classify scientific text segments.
+RETURN: JSON List of objects with keys 'id' and 'is_data'.
+LOGIC:
+- TRUE (is_data=true): Experimental results, values, units, kinetics (Km, kcat), conditions (pH, Temp), statistical data.
+- FALSE (is_data=false): Methods, recipes, citations, general introduction.
+OUTPUT ONLY THE JSON LIST."""
         )
         
-        # Configuración para salida determinista y limpia
         self.generation_config = genai.types.GenerationConfig(
             temperature=0.0,
             response_mime_type="application/json",
             response_schema=list[ClassificationResult]
         )
 
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(3),
+        reraise=True
+    )
     def classify_batch(self, items: List[Dict]) -> Dict[str, bool]:
-        """
-        Procesa lotes minimizando overhead.
-        """
-        if not items:
-            return {}
-
-        try:
-            # Minificamos el JSON de entrada para ahorrar tokens de input
-            # Enviamos solo ID y Content, sin claves extrañas
-            minified_items = [{"id": i["id"], "text": i["content"]} for i in items]
-            
-            response = self.model.generate_content(
-                json.dumps(minified_items),
-                generation_config=self.generation_config
-            )
-            
-            results = json.loads(response.text)
-            
-            classification_map = {}
-            for res in results:
-                # Mapeamos la respuesta corta 'is_data' a la lógica interna
-                item_id = res.get("id")
-                is_quantitative = res.get("is_data", False)
-                
-                if item_id:
-                    classification_map[item_id] = is_quantitative
-            
-            return classification_map
-
-        except Exception as e:
-            logger.error(f"❌ Batch Error: {e}")
-            # Fallback seguro: Si falla, asumimos True para revisión manual (High Recall)
-            return {item["id"]: True for item in items}
+        """Classify batch with exponential backoff retry."""
+        if not items: return {}
+        
+        # Minificamos el input
+        minified = [{"id": i["id"], "text": i["content"]} for i in items]
+        
+        response = self.model.generate_content(
+            json.dumps(minified),
+            generation_config=self.generation_config
+        )
+        
+        results = json.loads(response.text)
+        
+        # Convertimos a mapa simple
+        return {res["id"]: res["is_data"] for res in results if "id" in res}
 
 
 # --- Main Parser Class ---
@@ -928,73 +905,80 @@ class EnzymeParser:
                 logger.error(f"Error processing image {file_path.name}: {e}")
 
     def _classify_content(self, paper_data: PaperData):
-        """Filters text segments and visual artifacts using LLM."""
+        """
+        Filtra contenido con estrategia 'Fail-Safe High Recall'.
+        Cualquier fallo o silencio del LLM se asume como DATO RELEVANTE (TRUE).
+        """
         if not self.classifier:
-            logger.info("Skipping LLM classification (No API Key)")
             return
 
-        logger.info(f"Classifying {len(paper_data.text_segments)} segments and {len(paper_data.artifacts)} artifacts...")
+        logger.info(f"⚡ Iniciando clasificación rápida con Gemini...")
 
-        # 1. Preparar Payload (mezcla de texto e imágenes/captions)
-        # Convertimos objetos a dicts simples para el LLM
-        items_to_classify = []
-        
-        # Filtrar solo tipos relevantes para ahorrar tokens
-        # Ignoramos 'page_footer', 'checkbox', etc.
+        # 1. Recolectar todos los candidatos
+        # (Mezclamos texto y figuras en una sola lista para eficiencia)
+        candidates = []
         relevant_types = ['text', 'caption', 'section_header', 'list_item', 'table_cell'] 
         
         for seg in paper_data.text_segments:
-            if seg.type in relevant_types and len(seg.text) > 20: # Ignorar textos muy cortos
-                items_to_classify.append({
-                    "id": seg.id,
-                    "type": seg.type,
-                    "content": seg.text
-                })
-                
+            if seg.type in relevant_types:
+                candidates.append({"id": seg.id, "content": seg.text, "ref": seg})
+        
         for art in paper_data.artifacts:
-            # Para imágenes usamos el caption + descripción VLM si existe
             content = f"Caption: {art.caption}"
-            if art.vlm_description:
-                content += f" | AI Description: {art.vlm_description}"
-                
-            items_to_classify.append({
-                "id": art.id,
-                "type": art.type,
-                "content": content
-            })
+            if art.vlm_description: content += f" | AI: {art.vlm_description}"
+            candidates.append({"id": art.id, "content": content, "ref": art})
 
-        # 2. Procesar en Batches (Lotes de 50 items para seguridad)
-        BATCH_SIZE = 50
-        classification_results = {}
+        logger.info(f"   Total items a evaluar: {len(candidates)}")
+
+        # 2. Métricas de Auditoría
+        stats = {
+            "sent": 0,
+            "received": 0,
+            "ignored_by_llm": 0, # <--- LO QUE QUIERES SABER
+            "api_errors": 0
+        }
+
+        # 3. Procesar en Batches
+        BATCH_SIZE = 20
         
-        for i in range(0, len(items_to_classify), BATCH_SIZE):
-            batch = items_to_classify[i:i + BATCH_SIZE]
-            logger.info(f"  -> Sending batch {i} to {i+len(batch)} to Gemini...")
+        for i in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[i:i + BATCH_SIZE]
+            stats["sent"] += len(batch)
             
-            batch_results = self.classifier.classify_batch(batch)
-            classification_results.update(batch_results)
-            
-            # Pequeña pausa para rate limits si no tienes tier pagado
-            time.sleep(1) 
+            # Llamada API (Segura)
+            try:
+                # Quitamos la referencia al objeto antes de enviar al LLM para no romper JSON serializable
+                batch_input = [{"id": item["id"], "content": item["content"]} for item in batch]
+                results_map = self.classifier.classify_batch(batch_input)
+            except Exception:
+                results_map = {} # Simulamos respuesta vacía para activar fail-safe global
+                stats["api_errors"] += 1
 
-        # 3. Actualizar los objetos originales con el resultado
-        count_positive = 0
-        
-        for seg in paper_data.text_segments:
-            if seg.id in classification_results:
-                seg.has_quantitative_data = classification_results[seg.id]
-                if seg.has_quantitative_data: count_positive += 1
-            else:
-                seg.has_quantitative_data = False # Default si no se procesó
+            stats["received"] += len(results_map)
 
-        for art in paper_data.artifacts:
-            if art.id in classification_results:
-                art.has_quantitative_data = classification_results[art.id]
-                if art.has_quantitative_data: count_positive += 1
-            else:
-                art.has_quantitative_data = False
+            # 4. Asignación y Fail-Safe (Tu Lógica de Negocio)
+            for item in batch:
+                obj = item["ref"] # Recuperamos el objeto original (TextSegment o VisualArtifact)
+                item_id = item["id"]
 
-        logger.info(f"  -> Classification complete. Found {count_positive} items with data.")
+                if item_id in results_map:
+                    # El LLM respondió explícitamente
+                    obj.has_quantitative_data = results_map[item_id]
+                else:
+                    # El LLM IGNORÓ este ID o la API falló -> ASUMIMOS TRUE
+                    obj.has_quantitative_data = True
+                    stats["ignored_by_llm"] += 1 # Contamos el olvido
+
+        # 5. Reporte Final en Consola (Lo que verás en Streamlit)
+        if stats["ignored_by_llm"] > 0 or stats["api_errors"] > 0:
+            logger.warning(f"⚠️ REPORTE DE INTEGRIDAD ({paper_data.paper_id}):")
+            logger.warning(f"   Items Enviados: {stats['sent']}")
+            logger.warning(f"   Respuestas Explícitas: {stats['received']}")
+            logger.warning(f"   IGNORED BY LLM (Auto-TRUE): {stats['ignored_by_llm']} segmentos")
+            if stats["api_errors"] > 0:
+                logger.error(f"   Batches Fallidos: {stats['api_errors']}")
+        else:
+            logger.info(f"✅ Clasificación perfecta: {stats['sent']} items procesados sin fugas.")
 
     def filter_paper_with_llm(self, text_content: str) -> Dict[str, Any]:
         """
@@ -1004,8 +988,8 @@ class EnzymeParser:
             return {"status": "skipped", "reason": "No API Key"}
 
         try:
-            # Use Gemini 2.5 Flash Lite
-            model = genai.GenerativeModel('gemini-2.5-flash-lite')
+            # Use configured LLM model
+            model = genai.GenerativeModel(DEFAULT_LLM_MODEL)
             
             # Construct Prompt
             prompt = """
@@ -1024,8 +1008,9 @@ class EnzymeParser:
             Text content:
             """
             
-            # For now passing full text as Docling markdown is usually reasonable in size.
-            final_prompt = prompt + text_content[:500000] # Safety limit of 500k chars ~120k tokens
+            # Only send first ~20k chars (title + abstract + intro) for classification
+            # Full text is unnecessary and wastes tokens/money
+            final_prompt = prompt + text_content[:20000]
 
             response = model.generate_content(
                 final_prompt,
