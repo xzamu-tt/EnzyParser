@@ -55,25 +55,41 @@ def crop_image(full_page_img, bbox):
 # --- LÓGICA DEL FEED ---
 
 def merge_and_sort_blocks(data):
-    """Fusiona textos y artefactos en una sola lista cronológica."""
+    """Fusiona textos, artefactos y TABLAS en una sola lista cronológica."""
     blocks = []
     
+    # 1. Texto
     for seg in data.get("text_segments", []):
         seg["block_type"] = "text"
         blocks.append(seg)
         
+    # 2. Artefactos (Figuras)
     for art in data.get("artifacts", []):
         art["block_type"] = "artifact"
         blocks.append(art)
+
+    # 3. Tablas (PDF y Excel)
+    for tbl in data.get("tables_data", []):
+        tbl["block_type"] = "table"
+        # Asegurar compatibilidad de ordenamiento para suplementarios (page 0)
+        if "page" in tbl and "page_no" not in tbl: 
+            tbl["page_no"] = tbl["page"]
+        blocks.append(tbl)
         
-    blocks.sort(key=lambda x: (x.get("page_no", 0), x.get("bbox", [0,0,0,0])[1], x.get("bbox", [0,0,0,0])[0]))
+    # Ordenar por Página -> Posición Y (Arriba a Abajo) -> Posición X
+    # Nota: Usamos .get con defaults seguros para evitar crash con Excels sin bbox
+    blocks.sort(key=lambda x: (
+        x.get("page_no", 0), 
+        x.get("bbox", [0,0,0,0])[1] if x.get("bbox") else 0, 
+        x.get("bbox", [0,0,0,0])[0] if x.get("bbox") else 0
+    ))
     
     return blocks
 
 # --- COMPONENTES DE UI ---
 
 def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
-    """Renderiza una tarjeta individual (Bloque)."""
+    """Renderiza una tarjeta individual (Texto, Figura o Tabla)."""
     
     block_id = block.get("id")
     is_important = block.get("has_quantitative_data", False)
@@ -90,11 +106,14 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
     with st.container(border=True):
         c1, c2, c3 = st.columns([0.7, 0.15, 0.15])
         
+        type_label = block.get('type', block['block_type']).upper()
+        page_label = f"Pág {block.get('page_no', '-')}"
+        
         with c1:
             if is_important:
-                st.markdown(f"**:sparkles: RELEVANTE** | `{block['type']}` | Pág {block['page_no']}")
+                st.markdown(f"**:sparkles: RELEVANTE** | `{type_label}` | {page_label}")
             else:
-                st.markdown(f"*:grey[Contexto Expandido]* | `{block['type']}` | Pág {block['page_no']}")
+                st.markdown(f"*:grey[Contexto Expandido]* | `{type_label}` | {page_label}")
 
         with c2:
             if not is_important:
@@ -109,20 +128,71 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
                     st.rerun()
 
         with c3:
-            view_mode = st.toggle("Ver Original", key=f"view_{idx}_{block_id}")
+            # Toggle de vista (Solo útil para texto/tablas PDF, no imágenes)
+            if block["block_type"] != "artifact":
+                view_mode = st.toggle("Ver Original", key=f"view_{idx}_{block_id}")
+            else:
+                view_mode = False
 
+        # --- RENDERIZADO POR TIPO ---
+        
+        # CASO 1: FIGURAS (Artifacts)
         if block["block_type"] == "artifact":
             rel_path = block.get("file_path")
-            abs_path = Path(os.getcwd()) / rel_path 
+            if rel_path:
+                # Manejo robusto de rutas relativas/absolutas
+                abs_path = Path(output_dir) / st.session_state.selected_paper_id / "artifacts" / Path(rel_path).name
+                if not abs_path.exists():
+                    abs_path = Path(os.getcwd()) / rel_path
+                if not abs_path.exists():
+                    abs_path = Path(rel_path)
+                
+                if abs_path.exists():
+                    st.image(str(abs_path), caption=block.get("caption", "Figura"), width="stretch")
+                else:
+                    st.error(f"🖼️ Imagen no encontrada: {rel_path}")
             
-            if abs_path.exists():
-                st.image(str(abs_path), caption=block.get("caption", "Figura"), width="stretch")
-                if block.get("vlm_description"):
-                    with st.expander("Análisis IA"):
-                        st.write(block["vlm_description"])
-            else:
-                st.error(f"Imagen no encontrada: {rel_path}")
+            if block.get("vlm_description"):
+                with st.expander("Análisis IA"):
+                    st.write(block["vlm_description"])
 
+        # CASO 2: TABLAS (PDF y Excel)
+        elif block["block_type"] == "table":
+            caption = block.get("caption", "")
+            notes = block.get("table_notes", "")
+            
+            if caption: 
+                st.markdown(f"**Tabla:** {caption}")
+            
+            # 1. Si tenemos la imagen extraída por Docling, la mostramos PRIMERO (fuente de verdad)
+            table_img_path = block.get("image_path")
+            if table_img_path:
+                # Intentar múltiples rutas posibles
+                abs_path = Path(output_dir) / st.session_state.selected_paper_id / "artifacts" / Path(table_img_path).name
+                if not abs_path.exists():
+                    abs_path = Path(table_img_path)
+                
+                if abs_path.exists():
+                    st.image(str(abs_path), caption="Recorte Exacto de Tabla", use_container_width=True)
+            elif view_mode and pdf_path_str and block.get("page_no") and block.get("bbox"):
+                # Fallback: Vista Recorte PDF manual
+                page_img = get_pdf_page_image(pdf_path_str, block["page_no"])
+                if page_img:
+                    crop = crop_image(page_img, block["bbox"])
+                    st.image(crop, caption="Recorte del PDF")
+            
+            # 2. Toggle para ver los datos extraídos (OCR)
+            with st.expander("📊 Ver Datos Extraídos (OCR)", expanded=False):
+                if "data" in block and block["data"]:
+                    df = pd.DataFrame(block["data"])
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.warning("No se pudo extraer texto estructurado de esta tabla.")
+            
+            if notes: 
+                st.caption(f"📝 *Notas:* {notes}")
+
+        # CASO 3: TEXTO
         elif block["block_type"] == "text":
             if view_mode:
                 if pdf_path_str:
@@ -138,7 +208,7 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
                 else:
                     st.markdown(f"<span style='color:grey'>{block['text']}</span>", unsafe_allow_html=True)
 
-        # Context expansion buttons - now functional!
+        # Context expansion buttons
         sc1, sc2 = st.columns(2)
         
         # Find current index in ordered list
@@ -395,13 +465,21 @@ def tab_review():
             st.error("JSON de datos no encontrado.")
             return
 
-        # Stats
-        col1, col2, col3 = st.columns(3)
-        n_segments = len(data.get("text_segments", []))
-        n_relevant = sum(1 for s in data["text_segments"] if s.get("has_quantitative_data"))
-        col1.metric("Segmentos Totales", n_segments)
-        col2.metric("Datos Relevantes", n_relevant)
-        col3.metric("Figuras", len(data.get("artifacts", [])))
+        # Stats Reales (Contando todos los tipos)
+        col1, col2, col3, col4 = st.columns(4)
+        
+        all_blocks = merge_and_sort_blocks(data)
+        
+        n_text = sum(1 for b in all_blocks if b["block_type"] == "text" and b.get("has_quantitative_data"))
+        n_figs = sum(1 for b in all_blocks if b["block_type"] == "artifact" and b.get("has_quantitative_data"))
+        n_tabs = sum(1 for b in all_blocks if b["block_type"] == "table" and b.get("has_quantitative_data"))
+        
+        total_relevant = n_text + n_figs + n_tabs
+        
+        col1.metric("Total Relevantes", total_relevant)
+        col2.metric("Texto", n_text)
+        col3.metric("Tablas/Excel", n_tabs)
+        col4.metric("Figuras", n_figs)
         
         # LLM Classification Summary
         if data.get("llm_classification"):

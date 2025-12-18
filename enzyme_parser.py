@@ -77,7 +77,17 @@ class TextSegment(BaseModel):
     page_no: int
     bbox: List[float]  # [left, top, right, bottom]
     source_file: str
-    has_quantitative_data: Optional[bool] = None  # NUEVO CAMPO
+    has_quantitative_data: Optional[bool] = None
+
+
+class PaperClassificationResult(BaseModel):
+    """Estructura estricta para la clasificación global del paper."""
+    is_enzyme_paper: bool
+    enzyme_name: Optional[str] = None
+    organism: Optional[str] = None
+    relevance_score: float
+    summary: str
+    reasoning: str
 
 
 class PaperData(BaseModel):
@@ -90,7 +100,7 @@ class PaperData(BaseModel):
     artifacts: List[VisualArtifact] = []
     tables_data: List[Dict] = []
     supplementary_files_processed: List[str] = []
-    llm_classification: Optional[Dict[str, Any]] = None  # New field for LLM results
+    llm_classification: Optional[PaperClassificationResult] = None  # Modelo tipado fuerte
 
 
 # --- Definición de Tipos para Schema Estricto (Sin Reasoning) ---
@@ -186,8 +196,9 @@ class EnzymeParser:
         self.pipeline_options.do_ocr = True
         self.pipeline_options.do_table_structure = True
         
-        # Enable picture extraction
+        # Enable picture and TABLE image extraction
         self.pipeline_options.generate_picture_images = True
+        self.pipeline_options.generate_table_images = True  # Extract table snapshots as PNG
         self.pipeline_options.images_scale = 3.0  # High resolution for scientific graphics
         
         # VLM configuration (optional)
@@ -715,37 +726,58 @@ class EnzymeParser:
         if hasattr(doc, 'tables'):
             for i, table in enumerate(doc.tables):
                 try:
-                    if hasattr(table, 'export_to_dataframe'):
+                    # 1. Exportar datos (OCR - Intentamos obtenerlo, aunque falle)
+                    try:
                         df = table.export_to_dataframe(doc)
-                        
-                        # --- CONTEXTO RICO: Título + Notas ---
-                        ctx = self._find_table_context(table, doc)
-                        
-                        page_no = table.prov[0].page_no if table.prov else 0
-                        
-                        # Calcular BBox para UI
-                        bbox = [0.0, 0.0, 0.0, 0.0]
-                        if table.prov:
-                            b = table.prov[0].bbox
-                            bbox = [
-                                getattr(b, 'l', 0.0),
-                                getattr(b, 't', 0.0),
-                                getattr(b, 'r', 0.0),
-                                getattr(b, 'b', 0.0)
-                            ]
-                        
-                        # Guardar con estructura rica e ID
-                        paper_data.tables_data.append({
-                            "id": f"tbl_{i}",
-                            "type": "table",
-                            "source": pdf_path.name,
-                            "page": page_no,
-                            "bbox": bbox,
-                            "caption": ctx["caption"],
-                            "table_notes": ctx["notes"],  # Notas al pie (*p<0.05, etc.)
-                            "data": df.to_dict(orient="records"),
-                            "has_quantitative_data": True
-                        })
+                        data_records = df.to_dict(orient="records")
+                    except Exception:
+                        data_records = []
+
+                    # 2. Guardar imagen de la tabla (si está disponible)
+                    table_img_path = None
+                    if hasattr(table, 'image') and table.image:
+                        if hasattr(table.image, 'pil_image'):
+                            img = table.image.pil_image
+                            
+                            prefix = "MAIN" if is_main else "SUPP"
+                            page_no = table.prov[0].page_no if table.prov else 0
+                            
+                            filename = f"{prefix}_{pdf_path.stem}_p{page_no}_tbl{i}.png"
+                            save_path = artifacts_dir / filename
+                            
+                            img.save(save_path)
+                            table_img_path = str(save_path)
+                            logger.info(f"   Guardada imagen de tabla: {filename}")
+
+                    # 3. Contexto (Título y Notas)
+                    ctx = self._find_table_context(table, doc)
+                    
+                    page_no = table.prov[0].page_no if table.prov else 0
+                    
+                    # Calcular BBox para UI
+                    bbox = [0.0, 0.0, 0.0, 0.0]
+                    if table.prov:
+                        b = table.prov[0].bbox
+                        bbox = [
+                            getattr(b, 'l', 0.0),
+                            getattr(b, 't', 0.0),
+                            getattr(b, 'r', 0.0),
+                            getattr(b, 'b', 0.0)
+                        ]
+                    
+                    # 4. Guardar objeto rico con imagen y datos OCR
+                    paper_data.tables_data.append({
+                        "id": f"tbl_{i}",
+                        "type": "table",
+                        "source": pdf_path.name,
+                        "page": page_no,
+                        "bbox": bbox,
+                        "caption": ctx["caption"],
+                        "table_notes": ctx["notes"],
+                        "data": data_records,
+                        "image_path": table_img_path,  # Póliza de seguro visual
+                        "has_quantitative_data": True
+                    })
                 except Exception as e:
                     logger.warning(f"Error extracting table {i}: {e}")
         
@@ -874,10 +906,19 @@ class EnzymeParser:
                 else:
                     df = pd.read_excel(file_path)
                 
+                # Generamos un ID seguro basado en el nombre del archivo
+                safe_id = f"supp_{file_path.stem.replace(' ', '_').replace('.', '_')}"
+                
+                # Estructura completa + Flag True para visibilidad en UI
                 paper_data.tables_data.append({
+                    "id": safe_id,
+                    "type": "supplementary_table",
                     "source": file_path.name,
-                    "type": "supplementary_raw_data",
-                    "data": df.to_dict(orient="records")[:100]  # Limit rows
+                    "page": 0,
+                    "bbox": [0, 0, 0, 0],
+                    "caption": f"Supplementary Data: {file_path.name}",
+                    "data": df.to_dict(orient="records")[:100],  # Limit rows
+                    "has_quantitative_data": True  # Obligatorio para que la UI lo muestre
                 })
             except Exception as e:
                 logger.error(f"Error reading {file_path.name}: {e}")
@@ -982,7 +1023,7 @@ class EnzymeParser:
 
     def filter_paper_with_llm(self, text_content: str) -> Dict[str, Any]:
         """
-        Classifies the paper using Gemini 1.5 Flash to determine relevance to Enzyme Research.
+        Classifies the paper using Gemini to determine relevance to Enzyme Research.
         """
         if not self.has_gemini:
             return {"status": "skipped", "reason": "No API Key"}
@@ -1017,7 +1058,11 @@ class EnzymeParser:
                 generation_config={"response_mime_type": "application/json"}
             )
             
-            return json.loads(response.text)
+            json_result = json.loads(response.text)
+            
+            # Validación automática al instanciar el modelo Pydantic
+            # Si el LLM faltó un campo, esto lanzará error aquí mismo (Fail Fast)
+            return PaperClassificationResult(**json_result).model_dump()
 
         except Exception as e:
             logger.error(f"Gemini processing failed: {e}")
