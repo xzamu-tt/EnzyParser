@@ -6,6 +6,14 @@ from pathlib import Path
 from PIL import Image
 from pdf2image import convert_from_path
 import pandas as pd
+# =============================================================================
+# VISOR DE PDF INTERACTIVO
+# =============================================================================
+# streamlit-pdf-viewer es un componente que permite mostrar PDFs directamente
+# en Streamlit con anotaciones (bounding boxes) y callbacks cuando se clica.
+# =============================================================================
+from streamlit_pdf_viewer import pdf_viewer
+
 
 # Configuración de la página
 st.set_page_config(layout="wide", page_title="EnzyParser Distilled Reader")
@@ -43,35 +51,46 @@ def get_pdf_page_image(pdf_path, page_num):
         return None
 
 # =============================================================================
-# FUNCIÓN: crop_image
+# FUNCIÓN: highlight_region_on_page
 # =============================================================================
-# PROPÓSITO: Recortar una región específica de una imagen de página PDF.
+# PROPÓSITO: Mostrar la página completa del PDF con un rectángulo rojo
+#            resaltando la región donde está el elemento (texto, tabla, figura).
 #
-# ¿POR QUÉ ES NECESARIA LA CONVERSIÓN DE COORDENADAS?
-# Docling usa un sistema de coordenadas con origen en la ESQUINA INFERIOR IZQUIERDA
-# (como en matemáticas: Y aumenta hacia arriba).
+# ¿POR QUÉ ES MEJOR QUE SOLO RECORTAR?
+# 1. Puedes ver el CONTEXTO - qué hay alrededor del elemento.
+# 2. Puedes entender DÓNDE en la página está ubicado el elemento.
+# 3. Es más fácil verificar que Docling extrajo la información correcta.
 #
-# Pero PIL/Pillow (la librería de imágenes) usa origen en la ESQUINA SUPERIOR IZQUIERDA
-# (como en pantallas: Y aumenta hacia abajo).
-#
-# Además, Docling usa una base de 72 DPI (puntos por pulgada), pero la imagen
-# renderizada puede tener una resolución diferente, así que escalamos las coordenadas.
+# ¿CÓMO FUNCIONA?
+# 1. Toma la imagen completa de la página del PDF.
+# 2. Calcula dónde dibujar el rectángulo usando las coordenadas (bbox).
+# 3. Convierte las coordenadas de Docling al sistema de PIL.
+# 4. Dibuja un rectángulo rojo semi-grueso alrededor de la región.
+# 5. Retorna la imagen con el rectángulo dibujado.
 #
 # ARGUMENTOS:
 #   - full_page_img: La imagen completa de la página del PDF.
 #   - bbox: Lista de 4 números [left, top, right, bottom] de Docling.
-#           Nota: En Docling, "top" es el borde superior y "bottom" el inferior,
-#           pero medidos desde abajo de la página.
+#   - color: Color del rectángulo (por defecto rojo).
+#   - width: Grosor de la línea del rectángulo (por defecto 4 píxeles).
 #
 # RETORNA:
-#   - Una imagen recortada (solo la región del bbox).
+#   - La imagen de la página completa con el rectángulo dibujado.
 #   - O None si algo falla.
 # =============================================================================
-def crop_image(full_page_img, bbox):
+def highlight_region_on_page(full_page_img, bbox, color="red", width=4):
     """
-    Recorta la imagen usando bbox [L, T, R, B] de Docling.
-    Convierte del sistema de coordenadas de Docling al de PIL.
+    Dibuja un rectángulo resaltando una región en la imagen de la página.
+    Convierte coordenadas de Docling (origen inferior-izquierdo) a PIL (origen superior-izquierdo).
     """
+    # -------------------------------------------------------------------------
+    # Importar ImageDraw para dibujar sobre la imagen.
+    # -------------------------------------------------------------------------
+    # ImageDraw es parte de PIL/Pillow y permite dibujar formas sobre imágenes.
+    # Lo importamos aquí para que el código sea auto-contenido.
+    # -------------------------------------------------------------------------
+    from PIL import ImageDraw
+    
     # -------------------------------------------------------------------------
     # Paso 1: Verificar que tenemos una imagen válida.
     # -------------------------------------------------------------------------
@@ -85,87 +104,191 @@ def crop_image(full_page_img, bbox):
         return None
     
     # -------------------------------------------------------------------------
-    # Paso 3: Calcular factores de escala.
+    # Paso 3: Hacer una COPIA de la imagen.
+    # -------------------------------------------------------------------------
+    # Importante: Usamos .copy() para no modificar la imagen original.
+    # Si no hacemos copia, la imagen original quedaría con los rectángulos
+    # dibujados permanentemente.
+    # -------------------------------------------------------------------------
+    img_with_highlight = full_page_img.copy()
+    
+    # -------------------------------------------------------------------------
+    # Paso 4: Calcular factores de escala.
     # -------------------------------------------------------------------------
     # Docling asume páginas de 612x792 puntos (tamaño carta a 72 DPI).
-    # La imagen real puede tener diferente resolución, así que escalamos.
+    # La imagen renderizada puede tener diferente resolución.
+    # -------------------------------------------------------------------------
+    page_width_pts = 612.0   # Ancho estándar en puntos
+    page_height_pts = 792.0  # Alto estándar en puntos
+    
+    scale_x = img_with_highlight.width / page_width_pts
+    scale_y = img_with_highlight.height / page_height_pts
+    
+    # -------------------------------------------------------------------------
+    # Paso 5: Extraer coordenadas del bbox.
+    # -------------------------------------------------------------------------
+    l, t, r, b = bbox  # left, top, right, bottom
+    
+    # -------------------------------------------------------------------------
+    # Paso 6: Convertir coordenadas de Docling a PIL.
+    # -------------------------------------------------------------------------
+    # Docling: Origen en esquina INFERIOR izquierda (Y crece hacia arriba)
+    # PIL:     Origen en esquina SUPERIOR izquierda (Y crece hacia abajo)
     #
-    # Ejemplo: Si la imagen es 1224 px de ancho y Docling usa 612 pts,
-    #          entonces scale_x = 1224 / 612 = 2.0
+    # Fórmula de conversión para Y:
+    #   y_pil = altura_imagen - (y_docling * escala)
     # -------------------------------------------------------------------------
-    page_width_pts = 612.0   # Ancho estándar en puntos (72 DPI)
-    page_height_pts = 792.0  # Alto estándar en puntos (72 DPI)
     
-    scale_x = full_page_img.width / page_width_pts
-    scale_y = full_page_img.height / page_height_pts
+    # Coordenadas X (horizontales) - solo escalar, no invertir
+    x1 = l * scale_x
+    x2 = r * scale_x
+    
+    # Coordenadas Y (verticales) - escalar E invertir
+    # En Docling, 't' es el borde superior (valor Y más alto)
+    # En Docling, 'b' es el borde inferior (valor Y más bajo)
+    y1_docling = t * scale_y
+    y2_docling = b * scale_y
+    
+    # Convertir a sistema PIL (invertir Y)
+    y1_pil = img_with_highlight.height - y1_docling  # Top → arriba en pantalla
+    y2_pil = img_with_highlight.height - y2_docling  # Bottom → abajo en pantalla
     
     # -------------------------------------------------------------------------
-    # Paso 4: Extraer coordenadas del bbox.
+    # Paso 7: Ordenar coordenadas correctamente.
     # -------------------------------------------------------------------------
-    # l = left (izquierda), t = top (arriba), r = right (derecha), b = bottom (abajo)
+    # PIL espera: (left, top, right, bottom) donde left < right y top < bottom
+    # -------------------------------------------------------------------------
+    rect_left = min(x1, x2)
+    rect_right = max(x1, x2)
+    rect_top = min(y1_pil, y2_pil)      # El menor valor Y está arriba
+    rect_bottom = max(y1_pil, y2_pil)   # El mayor valor Y está abajo
+    
+    # -------------------------------------------------------------------------
+    # Paso 8: Asegurar que las coordenadas están dentro de la imagen.
+    # -------------------------------------------------------------------------
+    rect_left = max(0, rect_left)
+    rect_top = max(0, rect_top)
+    rect_right = min(img_with_highlight.width, rect_right)
+    rect_bottom = min(img_with_highlight.height, rect_bottom)
+    
+    # -------------------------------------------------------------------------
+    # Paso 9: Verificar que el rectángulo tiene área válida.
+    # -------------------------------------------------------------------------
+    if rect_right <= rect_left or rect_bottom <= rect_top:
+        return img_with_highlight  # Retornar imagen sin rectángulo
+    
+    # -------------------------------------------------------------------------
+    # Paso 10: Crear objeto para dibujar sobre la imagen.
+    # -------------------------------------------------------------------------
+    # ImageDraw.Draw() crea un "pincel" que puede dibujar sobre la imagen.
+    # -------------------------------------------------------------------------
+    draw = ImageDraw.Draw(img_with_highlight)
+    
+    # -------------------------------------------------------------------------
+    # Paso 11: Dibujar el rectángulo.
+    # -------------------------------------------------------------------------
+    # .rectangle() dibuja un rectángulo.
+    # - xy: Las coordenadas [(x1, y1), (x2, y2)] de las esquinas opuestas.
+    # - outline: El color del borde (rojo por defecto).
+    # - width: El grosor de la línea.
+    # -------------------------------------------------------------------------
+    draw.rectangle(
+        [(rect_left, rect_top), (rect_right, rect_bottom)],
+        outline=color,
+        width=width
+    )
+    
+    # -------------------------------------------------------------------------
+    # Paso 12: Retornar la imagen con el rectángulo dibujado.
+    # -------------------------------------------------------------------------
+    return img_with_highlight
+
+
+# =============================================================================
+# FUNCIÓN: docling_bbox_to_pdf_annotation
+# =============================================================================
+# PROPÓSITO: Convertir las coordenadas de Docling al formato que usa
+#            streamlit-pdf-viewer para dibujar anotaciones sobre el PDF.
+#
+# ¿POR QUÉ ES NECESARIA?
+# Docling y streamlit-pdf-viewer usan sistemas de coordenadas diferentes:
+#
+# DOCLING:
+#   - Origen en esquina INFERIOR IZQUIERDA
+#   - bbox = [left, top, right, bottom] donde top > bottom
+#   - Unidad: puntos PDF (72 por pulgada)
+#
+# STREAMLIT-PDF-VIEWER:
+#   - Origen en esquina SUPERIOR IZQUIERDA (como PDF.js)
+#   - Formato: {page, x, y, width, height, color}
+#   - x, y es la esquina SUPERIOR IZQUIERDA de la anotación
+#
+# ARGUMENTOS:
+#   - block: Diccionario con información del bloque (tiene bbox, page_no, id)
+#   - page_height: Altura de la página en puntos (792 para carta estándar)
+#   - color: Color del rectángulo de anotación
+#
+# RETORNA:
+#   - Diccionario en el formato de streamlit-pdf-viewer, o None si no hay bbox
+# =============================================================================
+def docling_bbox_to_pdf_annotation(block, page_height=792, color="red"):
+    """
+    Convierte bbox de Docling [L, T, R, B] al formato de streamlit-pdf-viewer.
+    """
+    # -------------------------------------------------------------------------
+    # Paso 1: Verificar que el bloque tiene las propiedades necesarias.
+    # -------------------------------------------------------------------------
+    bbox = block.get("bbox")
+    page_no = block.get("page_no")
+    block_id = block.get("id", "unknown")
+    
+    if not bbox or not page_no:
+        return None
+    
+    if len(bbox) != 4:
+        return None
+    
+    # -------------------------------------------------------------------------
+    # Paso 2: Extraer coordenadas del bbox.
+    # -------------------------------------------------------------------------
+    # En Docling: l=left, t=top (Y alto), r=right, b=bottom (Y bajo)
     # -------------------------------------------------------------------------
     l, t, r, b = bbox
     
     # -------------------------------------------------------------------------
-    # Paso 5: Convertir coordenadas de Docling a coordenadas de PIL.
+    # Paso 3: Calcular dimensiones del rectángulo.
     # -------------------------------------------------------------------------
-    # Docling: Origen en esquina INFERIOR izquierda, Y crece hacia ARRIBA.
-    # PIL:     Origen en esquina SUPERIOR izquierda, Y crece hacia ABAJO.
+    # Ancho = derecha - izquierda
+    # Alto = top - bottom (porque en Docling t > b)
+    # -------------------------------------------------------------------------
+    width = abs(r - l)
+    height = abs(t - b)
+    
+    # -------------------------------------------------------------------------
+    # Paso 4: Convertir la coordenada Y al sistema de PDF.js.
+    # -------------------------------------------------------------------------
+    # En Docling, 't' es la posición Y del borde SUPERIOR, medida desde abajo.
+    # En PDF.js, 'y' es la posición Y del borde SUPERIOR, medida desde arriba.
     #
-    # Para convertir Y de Docling a PIL:
-    #   y_pil = altura_pagina - y_docling
+    # Fórmula: y_pdfjs = page_height - t_docling
     #
-    # Además, en el bbox de Docling:
-    #   - "t" (top) es la coordenada Y del borde SUPERIOR del elemento
-    #   - "b" (bottom) es la coordenada Y del borde INFERIOR del elemento
-    #
-    # Pero como Docling mide desde abajo, en realidad:
-    #   - t tiene un valor MAYOR que b (está más arriba en la página)
-    #
-    # Para PIL necesitamos:
-    #   - y1 = la coordenada Y más pequeña (borde superior en pantalla)
-    #   - y2 = la coordenada Y más grande (borde inferior en pantalla)
+    # Pero streamlit-pdf-viewer espera la esquina superior izquierda,
+    # que es donde empieza el elemento.
     # -------------------------------------------------------------------------
-    
-    # Escalar coordenadas X (horizontales) - estas no cambian de orientación
-    x1 = l * scale_x  # Borde izquierdo
-    x2 = r * scale_x  # Borde derecho
-    
-    # Convertir y escalar coordenadas Y (verticales)
-    # En Docling: t > b (porque t está más arriba, más lejos del origen inferior)
-    # En PIL: necesitamos y1 < y2
-    y1_docling = t * scale_y  # Posición Y del top en coords Docling escaladas
-    y2_docling = b * scale_y  # Posición Y del bottom en coords Docling escaladas
-    
-    # Convertir a sistema PIL (invertir Y)
-    y1_pil = full_page_img.height - y1_docling  # Top de Docling → más arriba en PIL
-    y2_pil = full_page_img.height - y2_docling  # Bottom de Docling → más abajo en PIL
+    y_pdfjs = page_height - t  # Convertir Y de Docling a PDF.js
     
     # -------------------------------------------------------------------------
-    # Paso 6: Asegurar que las coordenadas están en orden correcto.
+    # Paso 5: Construir el diccionario de anotación.
     # -------------------------------------------------------------------------
-    # PIL requiere: (left, upper, right, lower) donde left < right y upper < lower.
-    # Usamos min/max para garantizar el orden correcto.
-    # -------------------------------------------------------------------------
-    crop_left = max(0, min(x1, x2))                        # No menor que 0
-    crop_right = min(full_page_img.width, max(x1, x2))     # No mayor que ancho
-    crop_upper = max(0, min(y1_pil, y2_pil))               # No menor que 0
-    crop_lower = min(full_page_img.height, max(y1_pil, y2_pil))  # No mayor que alto
-    
-    # -------------------------------------------------------------------------
-    # Paso 7: Verificar que el recorte tiene área válida.
-    # -------------------------------------------------------------------------
-    if crop_right <= crop_left or crop_lower <= crop_upper:
-        # El recorte no tiene área (ancho o alto es 0 o negativo)
-        return None
-    
-    # -------------------------------------------------------------------------
-    # Paso 8: Realizar el recorte.
-    # -------------------------------------------------------------------------
-    # .crop() de PIL recibe una tupla: (left, upper, right, lower)
-    # -------------------------------------------------------------------------
-    return full_page_img.crop((crop_left, crop_upper, crop_right, crop_lower))
-
+    return {
+        "page": page_no,        # Número de página (1-indexed)
+        "x": l,                  # Coordenada X (izquierda)
+        "y": y_pdfjs,           # Coordenada Y (desde arriba de la página)
+        "width": width,          # Ancho del rectángulo
+        "height": height,        # Alto del rectángulo
+        "color": color,          # Color del borde
+        "id": block_id           # ID para identificar el bloque al hacer clic
+    }
 
 # =============================================================================
 # FUNCIÓN: resolve_source_pdf_path
@@ -482,22 +605,23 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
                     
                     if page_img:
                         # -----------------------------------------------------
-                        # PASO 4: Recortar la imagen usando las coordenadas.
+                        # PASO 4: Resaltar la región en la página completa.
                         # -----------------------------------------------------
                         # block["bbox"] contiene [izquierda, arriba, derecha, abajo]
                         # Son las coordenadas exactas de donde está la tabla.
-                        # crop_image() recorta solo esa región de la página.
+                        # highlight_region_on_page() dibuja un rectángulo rojo
+                        # alrededor de esa región en la página completa.
                         # -----------------------------------------------------
-                        crop = crop_image(page_img, block["bbox"])
+                        highlighted_page = highlight_region_on_page(page_img, block["bbox"])
                         
                         # -----------------------------------------------------
-                        # PASO 5: Mostrar la imagen recortada en la pantalla.
+                        # PASO 5: Mostrar la página con el rectángulo.
                         # -----------------------------------------------------
                         # st.image() es una función de Streamlit que muestra imágenes.
                         # caption= es el texto que aparece debajo de la imagen.
-                        # use_container_width=True hace que use todo el ancho.
+                        # width="stretch" hace que use todo el ancho disponible.
                         # -----------------------------------------------------
-                        st.image(crop, caption="📍 Recorte del PDF Original", use_container_width=True)
+                        st.image(highlighted_page, caption=f"📍 Página {block['page_no']} - Región resaltada en rojo", width="stretch")
                 else:
                     # ---------------------------------------------------------
                     # El archivo fuente no se encontró, mostrar advertencia.
@@ -554,7 +678,7 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
                     
                     if page_img:
                         # -----------------------------------------------------
-                        # PASO 4: Recortar usando las coordenadas bbox.
+                        # PASO 4: Resaltar la región en la página completa.
                         # -----------------------------------------------------
                         # bbox significa "bounding box" (caja delimitadora).
                         # Es un rectángulo que define exactamente dónde está
@@ -562,11 +686,13 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
                         #
                         # Docling extrae estas coordenadas cuando procesa el PDF,
                         # así sabemos exactamente dónde estaba cada elemento.
+                        # highlight_region_on_page() dibuja un rectángulo rojo
+                        # alrededor de esa región para que puedas verla en contexto.
                         # -----------------------------------------------------
-                        crop = crop_image(page_img, block["bbox"])
+                        highlighted_page = highlight_region_on_page(page_img, block["bbox"])
                         
-                        # Mostrar la imagen recortada con un caption descriptivo
-                        st.image(crop, caption="📍 Recorte original del PDF")
+                        # Mostrar la página completa con el rectángulo rojo
+                        st.image(highlighted_page, caption=f"📍 Página {block['page_no']} - Texto resaltado en rojo")
                     else:
                         st.warning("⚠️ No se pudo renderizar la página del PDF.")
                 else:
@@ -810,10 +936,27 @@ def tab_execution():
 
 
 def tab_review():
-    """Pestaña de Revisión de Papers Procesados."""
+    """
+    ==========================================================================
+    PESTAÑA DE REVISIÓN - LAYOUT SIDE-BY-SIDE
+    ==========================================================================
+    Esta función muestra la pestaña de revisión con dos columnas:
+    
+    COLUMNA IZQUIERDA (40%):
+        - Lista de bloques extraídos (texto, tablas, figuras)
+        - Al hacer clic en un bloque, el PDF salta a esa ubicación
+    
+    COLUMNA DERECHA (60%):
+        - Visor de PDF interactivo
+        - Muestra anotaciones (rectángulos rojos) en las posiciones de los bloques
+        - Al hacer clic en una anotación, resalta el bloque en la lista
+    ==========================================================================
+    """
     st.header("📄 Revisar Papers")
     
-    # Get output dir from session or use default
+    # -------------------------------------------------------------------------
+    # Paso 1: Obtener el directorio de salida.
+    # -------------------------------------------------------------------------
     output_dir = st.session_state.get("output_dir", str(DEFAULT_OUTPUT_DIR))
     output_path = Path(output_dir)
     
@@ -822,82 +965,193 @@ def tab_review():
         st.info("💡 Primero ejecuta el parser en la pestaña 'Ejecutar'")
         return
 
+    # -------------------------------------------------------------------------
+    # Paso 2: Listar papers disponibles.
+    # -------------------------------------------------------------------------
     papers = sorted([d.name for d in output_path.iterdir() if d.is_dir()])
     
     if not papers:
         st.warning("No hay papers procesados en el directorio de salida.")
         return
     
+    # -------------------------------------------------------------------------
+    # Paso 3: Selector de paper.
+    # -------------------------------------------------------------------------
     selected_paper = st.selectbox("Seleccionar Artículo", papers)
     
-    if selected_paper:
-        st.session_state.selected_paper_id = selected_paper
-        data = load_paper_data(output_dir, selected_paper)
+    if not selected_paper:
+        return
         
-        if not data:
-            st.error("JSON de datos no encontrado.")
-            return
+    st.session_state.selected_paper_id = selected_paper
+    data = load_paper_data(output_dir, selected_paper)
+    
+    if not data:
+        st.error("JSON de datos no encontrado.")
+        return
 
-        # Group blocks by source file
-        grouped_blocks = group_blocks_by_source(data, selected_paper)
+    # -------------------------------------------------------------------------
+    # Paso 4: Preparar datos.
+    # -------------------------------------------------------------------------
+    grouped_blocks = group_blocks_by_source(data, selected_paper)
+    all_blocks = merge_and_sort_blocks(data)
+    total_relevant = sum(1 for b in all_blocks if b.get("has_quantitative_data"))
+    
+    # -------------------------------------------------------------------------
+    # Paso 5: Estadísticas rápidas.
+    # -------------------------------------------------------------------------
+    st.metric("📈 Total Bloques Relevantes", total_relevant)
+    
+    st.divider()
+    
+    # -------------------------------------------------------------------------
+    # Paso 6: LAYOUT SIDE-BY-SIDE.
+    # -------------------------------------------------------------------------
+    # Creamos dos columnas: izquierda para contenido, derecha para PDF.
+    # -------------------------------------------------------------------------
+    col_content, col_pdf = st.columns([0.45, 0.55])
+    
+    # =========================================================================
+    # COLUMNA IZQUIERDA: Lista de Contenido Extraído
+    # =========================================================================
+    with col_content:
+        st.subheader("📋 Contenido Extraído")
         
-        # --- STATISTICS BY SOURCE ---
-        st.subheader("📊 Estadísticas por Fuente")
+        # Inicializar estado para el bloque seleccionado
+        if "selected_block_id" not in st.session_state:
+            st.session_state.selected_block_id = None
         
-        stats_cols = st.columns(len(grouped_blocks) + 1)
-        
-        # Total stats
-        all_blocks = merge_and_sort_blocks(data)
-        total_relevant = sum(1 for b in all_blocks if b.get("has_quantitative_data"))
-        stats_cols[0].metric("📈 Total Relevantes", total_relevant)
-        
-        # Per-source stats
-        for i, (source_name, blocks) in enumerate(grouped_blocks.items(), 1):
-            is_main = source_name.startswith("MAIN")
-            icon = "📕" if is_main else "📎"
-            relevant_count = sum(1 for b in blocks if b.get("has_quantitative_data"))
-            short_name = source_name.split(": ", 1)[1] if ": " in source_name else source_name
-            # Truncate long names
-            if len(short_name) > 20:
-                short_name = short_name[:17] + "..."
-            stats_cols[i].metric(f"{icon} {short_name}", f"{relevant_count}/{len(blocks)}")
-        
-        # LLM Classification Summary
-        if data.get("llm_classification"):
-            with st.expander("🤖 Clasificación LLM", expanded=False):
-                st.json(data["llm_classification"])
-
-        st.divider()
-        st.caption("📋 Contenido agrupado por archivo fuente. Solo se muestran bloques relevantes.")
-        
-        pdf_path = data.get("original_pdf")
-        
-        # Create ordered list of IDs for context navigation (global across all sources)
-        all_ordered_ids = [b.get("id") for b in all_blocks]
-        
-        # Option to clear expanded context
-        if st.session_state.get("expanded_ids"):
-            if st.button("🔄 Limpiar contexto expandido", help="Ocultar todos los bloques de contexto"):
-                st.session_state.expanded_ids = set()
-                st.rerun()
-        
-        # --- RENDER GROUPED SECTIONS ---
+        # Iterar por cada fuente (PDF principal, suplementarios)
         for source_name, blocks in grouped_blocks.items():
             is_main = source_name.startswith("MAIN")
             icon = "📕" if is_main else "📎"
             
-            # Count relevant items in this section
-            relevant_in_section = sum(1 for b in blocks if b.get("has_quantitative_data"))
+            # Filtrar solo bloques relevantes
+            relevant_blocks = [b for b in blocks if b.get("has_quantitative_data")]
             
-            # Expander label
-            label = f"{icon} {source_name} ({relevant_in_section} relevantes / {len(blocks)} total)"
+            if not relevant_blocks:
+                continue
             
-            with st.expander(label, expanded=is_main):
-                if relevant_in_section == 0:
-                    st.info("No hay bloques relevantes en esta fuente.")
-                else:
-                    for i, block in enumerate(blocks):
-                        render_block(block, i, pdf_path, data, output_dir, all_ordered_ids, source_name=source_name)
+            # Crear expander para esta fuente
+            with st.expander(f"{icon} {source_name} ({len(relevant_blocks)} relevantes)", expanded=is_main):
+                for block in relevant_blocks:
+                    block_id = block.get("id", "unknown")
+                    block_type = block.get("block_type", "unknown").upper()
+                    page_no = block.get("page_no", "-")
+                    
+                    # Determinar si este bloque está seleccionado
+                    is_selected = st.session_state.selected_block_id == block_id
+                    
+                    # Crear un contenedor con borde para cada bloque
+                    with st.container(border=True):
+                        # Header del bloque
+                        header_col, btn_col = st.columns([0.75, 0.25])
+                        
+                        with header_col:
+                            # Mostrar indicador si está seleccionado
+                            selected_marker = "🔴 " if is_selected else ""
+                            st.markdown(f"**{selected_marker}`{block_type}`** | Pág {page_no}")
+                        
+                        with btn_col:
+                            # Botón para ir a esta ubicación en el PDF
+                            if st.button("📍 Ver", key=f"goto_{source_name}_{block_id}", use_container_width=True):
+                                st.session_state.selected_block_id = block_id
+                                st.session_state.selected_page = page_no
+                                st.rerun()
+                        
+                        # Contenido del bloque según su tipo
+                        if block_type == "TEXT":
+                            # Mostrar un preview del texto (primeras 200 chars)
+                            text = block.get("text", "")
+                            preview = text[:200] + "..." if len(text) > 200 else text
+                            st.caption(preview)
+                        
+                        elif block_type == "TABLE":
+                            # Mostrar caption de la tabla si existe
+                            caption = block.get("caption", "Tabla sin título")
+                            st.caption(f"📊 {caption[:100]}...")
+                        
+                        elif block_type == "ARTIFACT":
+                            # Mostrar caption de la figura
+                            caption = block.get("caption", "Figura sin título")
+                            st.caption(f"🖼️ {caption[:100]}...")
+    
+    # =========================================================================
+    # COLUMNA DERECHA: Visor de PDF Interactivo
+    # =========================================================================
+    with col_pdf:
+        st.subheader("📕 Documento Original")
+        
+        # ---------------------------------------------------------------------
+        # Paso A: Determinar qué PDF mostrar.
+        # ---------------------------------------------------------------------
+        # Por defecto, mostramos el PDF principal del paper.
+        # ---------------------------------------------------------------------
+        main_pdf_path = resolve_source_pdf_path(
+            {"source_file": f"{selected_paper}.pdf"},
+            selected_paper,
+            DEFAULT_INPUT_DIR
+        )
+        
+        if not main_pdf_path:
+            st.warning("No se encontró el PDF principal.")
+            return
+        
+        # ---------------------------------------------------------------------
+        # Paso B: Generar anotaciones para todos los bloques relevantes.
+        # ---------------------------------------------------------------------
+        # Convertimos cada bloque a formato de anotación para pdf_viewer.
+        # ---------------------------------------------------------------------
+        annotations = []
+        for block in all_blocks:
+            if block.get("has_quantitative_data") and block.get("bbox"):
+                annotation = docling_bbox_to_pdf_annotation(
+                    block,
+                    page_height=792,  # Altura estándar de página carta
+                    color="red"
+                )
+                if annotation:
+                    annotations.append(annotation)
+        
+        # ---------------------------------------------------------------------
+        # Paso C: Determinar la página inicial a mostrar.
+        # ---------------------------------------------------------------------
+        # Si hay un bloque seleccionado, ir a su página.
+        # ---------------------------------------------------------------------
+        scroll_to_page = None
+        if st.session_state.get("selected_page"):
+            scroll_to_page = st.session_state.selected_page
+        
+        # ---------------------------------------------------------------------
+        # Paso D: Mostrar el visor de PDF.
+        # ---------------------------------------------------------------------
+        # pdf_viewer() renderiza el PDF con las anotaciones.
+        #
+        # Parámetros importantes:
+        #   - input: Ruta al archivo PDF
+        #   - annotations: Lista de anotaciones (rectángulos)
+        #   - scroll_to_page: Página a la que saltar inicialmente
+        #   - render_text: Si renderizar texto seleccionable
+        #   - width: Ancho del visor
+        #   - height: Alto del visor (aumentado para mejor visualización)
+        #
+        # NOTA: NO usamos pages_to_render para mostrar TODAS las páginas
+        #       y permitir explorar el documento completo.
+        # ---------------------------------------------------------------------
+        try:
+            pdf_viewer(
+                input=main_pdf_path,
+                annotations=annotations if annotations else None,
+                width="100%",
+                height=800,
+                render_text=True,
+                scroll_to_page=scroll_to_page
+            )
+        except Exception as e:
+            st.error(f"Error al cargar el PDF: {e}")
+            # Fallback: mostrar mensaje de error detallado
+            st.code(str(e))
+
+
 
 
 
