@@ -11,8 +11,8 @@ import pandas as pd
 st.set_page_config(layout="wide", page_title="EnzyParser Distilled Reader")
 
 # Rutas por defecto (Ajusta según tu estructura)
-DEFAULT_INPUT_DIR = Path("./NEWarticles")
-DEFAULT_OUTPUT_DIR = Path("./Processed_Enzyme_Data")
+DEFAULT_INPUT_DIR = Path("/Users/xzamu/Desktop/PETase-database/PDFs/NEWarticles")
+DEFAULT_OUTPUT_DIR = Path("/Users/xzamu/Desktop/PETase-database/PDFs/Parsed-NEWarticles")
 
 # --- FUNCIONES DE UTILIDAD ---
 
@@ -42,17 +42,245 @@ def get_pdf_page_image(pdf_path, page_num):
         st.error(f"Error renderizando PDF: {e}")
         return None
 
+# =============================================================================
+# FUNCIÓN: crop_image
+# =============================================================================
+# PROPÓSITO: Recortar una región específica de una imagen de página PDF.
+#
+# ¿POR QUÉ ES NECESARIA LA CONVERSIÓN DE COORDENADAS?
+# Docling usa un sistema de coordenadas con origen en la ESQUINA INFERIOR IZQUIERDA
+# (como en matemáticas: Y aumenta hacia arriba).
+#
+# Pero PIL/Pillow (la librería de imágenes) usa origen en la ESQUINA SUPERIOR IZQUIERDA
+# (como en pantallas: Y aumenta hacia abajo).
+#
+# Además, Docling usa una base de 72 DPI (puntos por pulgada), pero la imagen
+# renderizada puede tener una resolución diferente, así que escalamos las coordenadas.
+#
+# ARGUMENTOS:
+#   - full_page_img: La imagen completa de la página del PDF.
+#   - bbox: Lista de 4 números [left, top, right, bottom] de Docling.
+#           Nota: En Docling, "top" es el borde superior y "bottom" el inferior,
+#           pero medidos desde abajo de la página.
+#
+# RETORNA:
+#   - Una imagen recortada (solo la región del bbox).
+#   - O None si algo falla.
+# =============================================================================
 def crop_image(full_page_img, bbox):
-    """Recorta la imagen usando bbox [L, T, R, B] de Docling (72 dpi base)."""
-    if not full_page_img: return None
+    """
+    Recorta la imagen usando bbox [L, T, R, B] de Docling.
+    Convierte del sistema de coordenadas de Docling al de PIL.
+    """
+    # -------------------------------------------------------------------------
+    # Paso 1: Verificar que tenemos una imagen válida.
+    # -------------------------------------------------------------------------
+    if not full_page_img:
+        return None
     
-    scale_x = full_page_img.width / 612.0
-    scale_y = full_page_img.height / 792.0
+    # -------------------------------------------------------------------------
+    # Paso 2: Verificar que el bbox tiene 4 valores.
+    # -------------------------------------------------------------------------
+    if not bbox or len(bbox) != 4:
+        return None
     
+    # -------------------------------------------------------------------------
+    # Paso 3: Calcular factores de escala.
+    # -------------------------------------------------------------------------
+    # Docling asume páginas de 612x792 puntos (tamaño carta a 72 DPI).
+    # La imagen real puede tener diferente resolución, así que escalamos.
+    #
+    # Ejemplo: Si la imagen es 1224 px de ancho y Docling usa 612 pts,
+    #          entonces scale_x = 1224 / 612 = 2.0
+    # -------------------------------------------------------------------------
+    page_width_pts = 612.0   # Ancho estándar en puntos (72 DPI)
+    page_height_pts = 792.0  # Alto estándar en puntos (72 DPI)
+    
+    scale_x = full_page_img.width / page_width_pts
+    scale_y = full_page_img.height / page_height_pts
+    
+    # -------------------------------------------------------------------------
+    # Paso 4: Extraer coordenadas del bbox.
+    # -------------------------------------------------------------------------
+    # l = left (izquierda), t = top (arriba), r = right (derecha), b = bottom (abajo)
+    # -------------------------------------------------------------------------
     l, t, r, b = bbox
-    return full_page_img.crop((l * scale_x, t * scale_y, r * scale_x, b * scale_y))
+    
+    # -------------------------------------------------------------------------
+    # Paso 5: Convertir coordenadas de Docling a coordenadas de PIL.
+    # -------------------------------------------------------------------------
+    # Docling: Origen en esquina INFERIOR izquierda, Y crece hacia ARRIBA.
+    # PIL:     Origen en esquina SUPERIOR izquierda, Y crece hacia ABAJO.
+    #
+    # Para convertir Y de Docling a PIL:
+    #   y_pil = altura_pagina - y_docling
+    #
+    # Además, en el bbox de Docling:
+    #   - "t" (top) es la coordenada Y del borde SUPERIOR del elemento
+    #   - "b" (bottom) es la coordenada Y del borde INFERIOR del elemento
+    #
+    # Pero como Docling mide desde abajo, en realidad:
+    #   - t tiene un valor MAYOR que b (está más arriba en la página)
+    #
+    # Para PIL necesitamos:
+    #   - y1 = la coordenada Y más pequeña (borde superior en pantalla)
+    #   - y2 = la coordenada Y más grande (borde inferior en pantalla)
+    # -------------------------------------------------------------------------
+    
+    # Escalar coordenadas X (horizontales) - estas no cambian de orientación
+    x1 = l * scale_x  # Borde izquierdo
+    x2 = r * scale_x  # Borde derecho
+    
+    # Convertir y escalar coordenadas Y (verticales)
+    # En Docling: t > b (porque t está más arriba, más lejos del origen inferior)
+    # En PIL: necesitamos y1 < y2
+    y1_docling = t * scale_y  # Posición Y del top en coords Docling escaladas
+    y2_docling = b * scale_y  # Posición Y del bottom en coords Docling escaladas
+    
+    # Convertir a sistema PIL (invertir Y)
+    y1_pil = full_page_img.height - y1_docling  # Top de Docling → más arriba en PIL
+    y2_pil = full_page_img.height - y2_docling  # Bottom de Docling → más abajo en PIL
+    
+    # -------------------------------------------------------------------------
+    # Paso 6: Asegurar que las coordenadas están en orden correcto.
+    # -------------------------------------------------------------------------
+    # PIL requiere: (left, upper, right, lower) donde left < right y upper < lower.
+    # Usamos min/max para garantizar el orden correcto.
+    # -------------------------------------------------------------------------
+    crop_left = max(0, min(x1, x2))                        # No menor que 0
+    crop_right = min(full_page_img.width, max(x1, x2))     # No mayor que ancho
+    crop_upper = max(0, min(y1_pil, y2_pil))               # No menor que 0
+    crop_lower = min(full_page_img.height, max(y1_pil, y2_pil))  # No mayor que alto
+    
+    # -------------------------------------------------------------------------
+    # Paso 7: Verificar que el recorte tiene área válida.
+    # -------------------------------------------------------------------------
+    if crop_right <= crop_left or crop_lower <= crop_upper:
+        # El recorte no tiene área (ancho o alto es 0 o negativo)
+        return None
+    
+    # -------------------------------------------------------------------------
+    # Paso 8: Realizar el recorte.
+    # -------------------------------------------------------------------------
+    # .crop() de PIL recibe una tupla: (left, upper, right, lower)
+    # -------------------------------------------------------------------------
+    return full_page_img.crop((crop_left, crop_upper, crop_right, crop_lower))
+
+
+# =============================================================================
+# FUNCIÓN: resolve_source_pdf_path
+# =============================================================================
+# PROPÓSITO: Encontrar la ruta del archivo PDF correcto para cualquier bloque.
+#
+# ¿POR QUÉ ES NECESARIA?
+# Cuando extraemos información de un paper científico, puede venir de:
+#   1. El PDF principal (ejemplo: "Almeida-2019.pdf")
+#   2. Un PDF suplementario (ejemplo: "Table 1.pdf", "Supporting_Info.pdf")
+#
+# Cada bloque de texto/tabla/figura guarda el nombre de su archivo fuente
+# en un campo llamado "source_file" o "source". Esta función busca ese
+# archivo en el disco para que podamos mostrar el recorte original.
+#
+# ARGUMENTOS:
+#   - block: Un diccionario (como una ficha) con la información del bloque.
+#            Contiene campos como "source_file", "page_no", "bbox", etc.
+#   - paper_id: El nombre del paper, ejemplo "Almeida-2019".
+#   - input_dir: La carpeta raíz donde están todos los papers originales.
+#
+# RETORNA:
+#   - Una cadena de texto (string) con la ruta completa al archivo PDF.
+#   - O None (vacío) si el archivo no existe en el disco.
+#
+# EJEMPLO DE USO:
+#   pdf_path = resolve_source_pdf_path(block, "Almeida-2019", "./NEWarticles")
+#   # Podría retornar: "/Users/.../NEWarticles/Almeida-2019/Table 1.pdf"
+# =============================================================================
+def resolve_source_pdf_path(block, paper_id, input_dir):
+    """
+    Encuentra la ruta completa al archivo PDF fuente de un bloque.
+    
+    Busca primero el campo 'source_file', luego 'source'.
+    Si no existe, asume que es el PDF principal del paper.
+    """
+    
+    # -------------------------------------------------------------------------
+    # PASO 1: Obtener el nombre del archivo fuente del bloque.
+    # -------------------------------------------------------------------------
+    # Los bloques extraídos guardan el nombre de su archivo origen.
+    # Usamos ".get()" que es un método seguro - si el campo no existe,
+    # retorna None en lugar de causar un error.
+    #
+    # El operador "or" funciona así:
+    #   - Si el primer valor existe y no está vacío, lo usa.
+    #   - Si no, intenta con el segundo valor.
+    # Es como decir: "Dame source_file, o si no existe, dame source".
+    # -------------------------------------------------------------------------
+    source_file = block.get("source_file") or block.get("source")
+    
+    # -------------------------------------------------------------------------
+    # PASO 2: Si no hay nombre de fuente, asumimos que es el PDF principal.
+    # -------------------------------------------------------------------------
+    # La convención es que el PDF principal tiene el mismo nombre que
+    # la carpeta del paper. Por ejemplo:
+    #   Carpeta: Almeida-2019/
+    #   PDF:     Almeida-2019.pdf
+    #
+    # f"..." es una "f-string" (formatted string). Las llaves {} se
+    # reemplazan por el valor de la variable. Ejemplo:
+    #   Si paper_id = "Almeida-2019"
+    #   Entonces f"{paper_id}.pdf" = "Almeida-2019.pdf"
+    # -------------------------------------------------------------------------
+    if not source_file:
+        source_file = f"{paper_id}.pdf"
+    
+    # -------------------------------------------------------------------------
+    # PASO 3: Verificar que el archivo es un PDF (no Excel, CSV, etc.)
+    # -------------------------------------------------------------------------
+    # Solo podemos mostrar recortes de archivos PDF.
+    # .lower() convierte a minúsculas para comparar sin importar mayúsculas.
+    # .endswith(".pdf") verifica si el nombre termina en ".pdf".
+    # -------------------------------------------------------------------------
+    if not source_file.lower().endswith(".pdf"):
+        return None  # No es un PDF, no podemos mostrar recorte
+    
+    # -------------------------------------------------------------------------
+    # PASO 4: Construir la ruta completa al archivo.
+    # -------------------------------------------------------------------------
+    # Path() es una clase de Python que maneja rutas de archivos.
+    # El operador "/" une partes de la ruta de forma segura.
+    # Funciona en Windows, Mac y Linux sin problemas.
+    #
+    # Ejemplo:
+    #   Path("./NEWarticles") / "Almeida-2019" / "Table 1.pdf"
+    #   Resultado: ./NEWarticles/Almeida-2019/Table 1.pdf
+    # -------------------------------------------------------------------------
+    full_path = Path(input_dir) / paper_id / source_file
+    
+    # -------------------------------------------------------------------------
+    # PASO 5: Verificar que el archivo existe en el disco.
+    # -------------------------------------------------------------------------
+    # .exists() es un método de Path que retorna:
+    #   - True: si el archivo está en el disco
+    #   - False: si no existe
+    #
+    # str(full_path) convierte el objeto Path a texto simple,
+    # porque otras funciones esperan texto, no objetos Path.
+    # -------------------------------------------------------------------------
+    if full_path.exists():
+        return str(full_path)
+    
+    # -------------------------------------------------------------------------
+    # PASO 6: El archivo no existe, retornar None.
+    # -------------------------------------------------------------------------
+    # None es el valor especial de Python que significa "nada" o "vacío".
+    # Las funciones que llamen a esta verificarán si el resultado es None
+    # para saber si deben mostrar un mensaje de error.
+    # -------------------------------------------------------------------------
+    return None
+
 
 # --- LÓGICA DEL FEED ---
+
 
 def merge_and_sort_blocks(data):
     """Fusiona textos, artefactos y TABLAS en una sola lista cronológica."""
@@ -86,9 +314,46 @@ def merge_and_sort_blocks(data):
     
     return blocks
 
+
+def group_blocks_by_source(data, paper_id: str):
+    """
+    Groups blocks by their source file, with Main PDF first.
+    Returns: OrderedDict {"MAIN: Paper.pdf": [...], "SUPP: data.xlsx": [...]}
+    """
+    from collections import OrderedDict
+    
+    # Get all blocks first
+    all_blocks = merge_and_sort_blocks(data)
+    
+    # Identify the main PDF filename
+    main_pdf_name = f"{paper_id}.pdf"
+    
+    # Group by source
+    groups = {}
+    for block in all_blocks:
+        # Determine source file
+        source = block.get("source_file") or block.get("source") or main_pdf_name
+        
+        if source not in groups:
+            groups[source] = []
+        groups[source].append(block)
+    
+    # Sort: Main PDF first, then supplementary files alphabetically
+    sorted_groups = OrderedDict()
+    
+    # Main PDF first
+    if main_pdf_name in groups:
+        sorted_groups[f"MAIN: {main_pdf_name}"] = groups.pop(main_pdf_name)
+    
+    # Then supplementary files sorted alphabetically
+    for source in sorted(groups.keys()):
+        sorted_groups[f"SUPP: {source}"] = groups[source]
+    
+    return sorted_groups
+
 # --- COMPONENTES DE UI ---
 
-def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
+def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, source_name="default"):
     """Renderiza una tarjeta individual (Texto, Figura o Tabla)."""
     
     block_id = block.get("id")
@@ -117,12 +382,12 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
 
         with c2:
             if not is_important:
-                if st.button("📌 Marcar Útil", key=f"mark_{idx}_{block_id}"):
+                if st.button("📌 Marcar Útil", key=f"mark_{source_name}_{idx}_{block_id}"):
                     block["has_quantitative_data"] = True
                     save_paper_data(output_dir, st.session_state.selected_paper_id, paper_data)
                     st.rerun()
             else:
-                if st.button("🗑️ Descartar", key=f"unmark_{idx}_{block_id}"):
+                if st.button("🗑️ Descartar", key=f"unmark_{source_name}_{idx}_{block_id}"):
                     block["has_quantitative_data"] = False
                     save_paper_data(output_dir, st.session_state.selected_paper_id, paper_data)
                     st.rerun()
@@ -130,7 +395,7 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
         with c3:
             # Toggle de vista (Solo útil para texto/tablas PDF, no imágenes)
             if block["block_type"] != "artifact":
-                view_mode = st.toggle("Ver Original", key=f"view_{idx}_{block_id}")
+                view_mode = st.toggle("Ver Original", key=f"view_{source_name}_{idx}_{block_id}")
             else:
                 view_mode = False
 
@@ -174,12 +439,71 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
                 
                 if abs_path.exists():
                     st.image(str(abs_path), caption="Recorte Exacto de Tabla", use_container_width=True)
-            elif view_mode and pdf_path_str and block.get("page_no") and block.get("bbox"):
-                # Fallback: Vista Recorte PDF manual
-                page_img = get_pdf_page_image(pdf_path_str, block["page_no"])
-                if page_img:
-                    crop = crop_image(page_img, block["bbox"])
-                    st.image(crop, caption="Recorte del PDF")
+            # -----------------------------------------------------------------
+            # FALLBACK: Recorte manual del PDF cuando no hay imagen guardada.
+            # -----------------------------------------------------------------
+            # Esto se ejecuta solo si:
+            #   - view_mode es True (el usuario activó "Ver Original")
+            #   - El bloque tiene número de página (page_no)
+            #   - El bloque tiene coordenadas (bbox = bounding box)
+            # -----------------------------------------------------------------
+            elif view_mode and block.get("page_no") and block.get("bbox"):
+                # -------------------------------------------------------------
+                # PASO 1: Encontrar el archivo PDF correcto para este bloque.
+                # -------------------------------------------------------------
+                # Usamos nuestra nueva función que busca el archivo real.
+                # 
+                # ARGUMENTOS:
+                #   block: La información del bloque actual (tiene source_file)
+                #   selected_paper_id: El nombre del paper (ej: "Almeida-2019")
+                #   DEFAULT_INPUT_DIR: Carpeta donde están los papers originales
+                # -------------------------------------------------------------
+                actual_pdf_path = resolve_source_pdf_path(
+                    block,                                    # El bloque actual
+                    st.session_state.selected_paper_id,       # Nombre del paper
+                    DEFAULT_INPUT_DIR                         # Carpeta de entrada
+                )
+                
+                # -------------------------------------------------------------
+                # PASO 2: Verificar que encontramos el archivo PDF.
+                # -------------------------------------------------------------
+                # actual_pdf_path será None si:
+                #   - El archivo no existe en el disco
+                #   - El archivo no es un PDF (es Excel, CSV, etc.)
+                # -------------------------------------------------------------
+                if actual_pdf_path:
+                    # ---------------------------------------------------------
+                    # PASO 3: Renderizar la página específica del PDF.
+                    # ---------------------------------------------------------
+                    # get_pdf_page_image() convierte una página PDF a imagen.
+                    # block["page_no"] indica qué página queremos ver.
+                    # ---------------------------------------------------------
+                    page_img = get_pdf_page_image(actual_pdf_path, block["page_no"])
+                    
+                    if page_img:
+                        # -----------------------------------------------------
+                        # PASO 4: Recortar la imagen usando las coordenadas.
+                        # -----------------------------------------------------
+                        # block["bbox"] contiene [izquierda, arriba, derecha, abajo]
+                        # Son las coordenadas exactas de donde está la tabla.
+                        # crop_image() recorta solo esa región de la página.
+                        # -----------------------------------------------------
+                        crop = crop_image(page_img, block["bbox"])
+                        
+                        # -----------------------------------------------------
+                        # PASO 5: Mostrar la imagen recortada en la pantalla.
+                        # -----------------------------------------------------
+                        # st.image() es una función de Streamlit que muestra imágenes.
+                        # caption= es el texto que aparece debajo de la imagen.
+                        # use_container_width=True hace que use todo el ancho.
+                        # -----------------------------------------------------
+                        st.image(crop, caption="📍 Recorte del PDF Original", use_container_width=True)
+                else:
+                    # ---------------------------------------------------------
+                    # El archivo fuente no se encontró, mostrar advertencia.
+                    # ---------------------------------------------------------
+                    source_name_display = block.get("source_file") or block.get("source") or "desconocido"
+                    st.warning(f"⚠️ No se encontró el archivo fuente: {source_name_display}")
             
             # 2. Toggle para ver los datos extraídos (OCR)
             with st.expander("📊 Ver Datos Extraídos (OCR)", expanded=False):
@@ -194,14 +518,63 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
 
         # CASO 3: TEXTO
         elif block["block_type"] == "text":
+            # -----------------------------------------------------------------
+            # MODO "VER ORIGINAL": Mostrar el recorte del PDF.
+            # -----------------------------------------------------------------
+            # Si el usuario activó el toggle "Ver Original", mostramos la
+            # región exacta del PDF donde está este texto.
+            # -----------------------------------------------------------------
             if view_mode:
-                if pdf_path_str:
-                    page_img = get_pdf_page_image(pdf_path_str, block["page_no"])
+                # -------------------------------------------------------------
+                # PASO 1: Encontrar el archivo PDF correcto para este bloque.
+                # -------------------------------------------------------------
+                # Los bloques de texto siempre vienen de PDFs, pero pueden ser
+                # del PDF principal o de un PDF suplementario. Esta función
+                # busca el archivo correcto basándose en el campo "source_file".
+                # -------------------------------------------------------------
+                actual_pdf_path = resolve_source_pdf_path(
+                    block,                                    # El bloque de texto
+                    st.session_state.selected_paper_id,       # Nombre del paper
+                    DEFAULT_INPUT_DIR                         # Carpeta de entrada
+                )
+                
+                # -------------------------------------------------------------
+                # PASO 2: Si encontramos el PDF, mostrar el recorte.
+                # -------------------------------------------------------------
+                if actual_pdf_path:
+                    # ---------------------------------------------------------
+                    # PASO 3: Renderizar la página del PDF como imagen.
+                    # ---------------------------------------------------------
+                    # Usamos la función get_pdf_page_image que:
+                    #   1. Abre el archivo PDF
+                    #   2. Va a la página indicada (page_no)
+                    #   3. Convierte esa página a una imagen
+                    # ---------------------------------------------------------
+                    page_img = get_pdf_page_image(actual_pdf_path, block["page_no"])
+                    
                     if page_img:
+                        # -----------------------------------------------------
+                        # PASO 4: Recortar usando las coordenadas bbox.
+                        # -----------------------------------------------------
+                        # bbox significa "bounding box" (caja delimitadora).
+                        # Es un rectángulo que define exactamente dónde está
+                        # el texto en la página: [izquierda, arriba, derecha, abajo]
+                        #
+                        # Docling extrae estas coordenadas cuando procesa el PDF,
+                        # así sabemos exactamente dónde estaba cada elemento.
+                        # -----------------------------------------------------
                         crop = crop_image(page_img, block["bbox"])
-                        st.image(crop, caption="Recorte original del PDF")
+                        
+                        # Mostrar la imagen recortada con un caption descriptivo
+                        st.image(crop, caption="📍 Recorte original del PDF")
+                    else:
+                        st.warning("⚠️ No se pudo renderizar la página del PDF.")
                 else:
-                    st.warning("PDF original no encontrado para generar vista.")
+                    # ---------------------------------------------------------
+                    # El archivo fuente no existe o no es un PDF.
+                    # ---------------------------------------------------------
+                    source_name_display = block.get("source_file") or block.get("source") or "principal"
+                    st.warning(f"⚠️ No se encontró el archivo fuente: {source_name_display}")
             else:
                 if is_important:
                     st.markdown(block["text"])
@@ -220,20 +593,20 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids):
         # Previous context button
         if current_idx > 0:
             prev_id = ordered_ids[current_idx - 1]
-            if sc1.button("⬆️ Contexto Previo", key=f"prev_{idx}_{block_id}", help="Mostrar bloque anterior"):
+            if sc1.button("⬆️ Contexto Previo", key=f"prev_{source_name}_{idx}_{block_id}", help="Mostrar bloque anterior"):
                 st.session_state.expanded_ids.add(prev_id)
                 st.rerun()
         else:
-            sc1.button("⬆️ Contexto Previo", key=f"prev_{idx}_{block_id}", disabled=True, help="No hay bloque anterior")
+            sc1.button("⬆️ Contexto Previo", key=f"prev_{source_name}_{idx}_{block_id}", disabled=True, help="No hay bloque anterior")
         
         # Next context button
         if current_idx < len(ordered_ids) - 1:
             next_id = ordered_ids[current_idx + 1]
-            if sc2.button("⬇️ Contexto Posterior", key=f"next_{idx}_{block_id}", help="Mostrar bloque siguiente"):
+            if sc2.button("⬇️ Contexto Posterior", key=f"next_{source_name}_{idx}_{block_id}", help="Mostrar bloque siguiente"):
                 st.session_state.expanded_ids.add(next_id)
                 st.rerun()
         else:
-            sc2.button("⬇️ Contexto Posterior", key=f"next_{idx}_{block_id}", disabled=True, help="No hay bloque siguiente")
+            sc2.button("⬇️ Contexto Posterior", key=f"next_{source_name}_{idx}_{block_id}", disabled=True, help="No hay bloque siguiente")
 
 
 # --- GUI UTILS ---
@@ -465,21 +838,29 @@ def tab_review():
             st.error("JSON de datos no encontrado.")
             return
 
-        # Stats Reales (Contando todos los tipos)
-        col1, col2, col3, col4 = st.columns(4)
+        # Group blocks by source file
+        grouped_blocks = group_blocks_by_source(data, selected_paper)
         
+        # --- STATISTICS BY SOURCE ---
+        st.subheader("📊 Estadísticas por Fuente")
+        
+        stats_cols = st.columns(len(grouped_blocks) + 1)
+        
+        # Total stats
         all_blocks = merge_and_sort_blocks(data)
+        total_relevant = sum(1 for b in all_blocks if b.get("has_quantitative_data"))
+        stats_cols[0].metric("📈 Total Relevantes", total_relevant)
         
-        n_text = sum(1 for b in all_blocks if b["block_type"] == "text" and b.get("has_quantitative_data"))
-        n_figs = sum(1 for b in all_blocks if b["block_type"] == "artifact" and b.get("has_quantitative_data"))
-        n_tabs = sum(1 for b in all_blocks if b["block_type"] == "table" and b.get("has_quantitative_data"))
-        
-        total_relevant = n_text + n_figs + n_tabs
-        
-        col1.metric("Total Relevantes", total_relevant)
-        col2.metric("Texto", n_text)
-        col3.metric("Tablas/Excel", n_tabs)
-        col4.metric("Figuras", n_figs)
+        # Per-source stats
+        for i, (source_name, blocks) in enumerate(grouped_blocks.items(), 1):
+            is_main = source_name.startswith("MAIN")
+            icon = "📕" if is_main else "📎"
+            relevant_count = sum(1 for b in blocks if b.get("has_quantitative_data"))
+            short_name = source_name.split(": ", 1)[1] if ": " in source_name else source_name
+            # Truncate long names
+            if len(short_name) > 20:
+                short_name = short_name[:17] + "..."
+            stats_cols[i].metric(f"{icon} {short_name}", f"{relevant_count}/{len(blocks)}")
         
         # LLM Classification Summary
         if data.get("llm_classification"):
@@ -487,13 +868,12 @@ def tab_review():
                 st.json(data["llm_classification"])
 
         st.divider()
-        st.caption("Modo de Revisión Destilada: Solo se muestra información clasificada como cuantitativa/experimental.")
+        st.caption("📋 Contenido agrupado por archivo fuente. Solo se muestran bloques relevantes.")
         
-        all_blocks = merge_and_sort_blocks(data)
         pdf_path = data.get("original_pdf")
         
-        # Create ordered list of IDs for context navigation
-        ordered_ids = [b.get("id") for b in all_blocks]
+        # Create ordered list of IDs for context navigation (global across all sources)
+        all_ordered_ids = [b.get("id") for b in all_blocks]
         
         # Option to clear expanded context
         if st.session_state.get("expanded_ids"):
@@ -501,8 +881,24 @@ def tab_review():
                 st.session_state.expanded_ids = set()
                 st.rerun()
         
-        for i, block in enumerate(all_blocks):
-            render_block(block, i, pdf_path, data, output_dir, ordered_ids)
+        # --- RENDER GROUPED SECTIONS ---
+        for source_name, blocks in grouped_blocks.items():
+            is_main = source_name.startswith("MAIN")
+            icon = "📕" if is_main else "📎"
+            
+            # Count relevant items in this section
+            relevant_in_section = sum(1 for b in blocks if b.get("has_quantitative_data"))
+            
+            # Expander label
+            label = f"{icon} {source_name} ({relevant_in_section} relevantes / {len(blocks)} total)"
+            
+            with st.expander(label, expanded=is_main):
+                if relevant_in_section == 0:
+                    st.info("No hay bloques relevantes en esta fuente.")
+                else:
+                    for i, block in enumerate(blocks):
+                        render_block(block, i, pdf_path, data, output_dir, all_ordered_ids, source_name=source_name)
+
 
 
 # --- MAIN APP ---

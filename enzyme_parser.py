@@ -1073,8 +1073,8 @@ class EnzymeParser:
 
 if __name__ == "__main__":
     # Configure paths
-    INPUT_DIR = "./NEWarticles"
-    OUTPUT_DIR = "./Processed_Enzyme_Data"
+    INPUT_DIR = "/Users/xzamu/Desktop/PETase-database/PDFs/NEWarticles"
+    OUTPUT_DIR = "/Users/xzamu/Desktop/PETase-database/PDFs/Parsed-NEWarticles"
     
     # Optional: Local VLM endpoint (LM Studio / Ollama / vLLM)
     # Set to None to skip VLM descriptions
