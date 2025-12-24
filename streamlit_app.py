@@ -487,18 +487,28 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
         st.session_state.expanded_ids = set()
     
     is_expanded_context = block_id in st.session_state.expanded_ids
+    is_selected = block_id == st.session_state.get("selected_block_id")
     
-    if not is_important and not is_expanded_context:
+    if not is_important and not is_expanded_context and not is_selected:
         return
 
-    with st.container(border=True):
+    # Si está seleccionado, usamos un contenedor visualmente distinto
+    if is_selected:
+        st.markdown(f"<div id='block-{block_id}'></div>", unsafe_allow_html=True) # Anchor (no funciona nativo pero es buena práctica)
+        st.error(f"🔴 **BLOQUE SELECCIONADO** (ID: {block_id})")
+        
+    container_border = True
+    
+    with st.container(border=container_border):
         c1, c2, c3 = st.columns([0.7, 0.15, 0.15])
         
         type_label = block.get('type', block['block_type']).upper()
         page_label = f"Pág {block.get('page_no', '-')}"
         
         with c1:
-            if is_important:
+            if is_selected:
+                st.markdown(f"**:red[🔴 SELECCIONADO]** | `{type_label}` | {page_label}")
+            elif is_important:
                 st.markdown(f"**:sparkles: RELEVANTE** | `{type_label}` | {page_label}")
             else:
                 st.markdown(f"*:grey[Contexto Expandido]* | `{type_label}` | {page_label}")
@@ -516,11 +526,22 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
                     st.rerun()
 
         with c3:
-            # Toggle de vista (Solo útil para texto/tablas PDF, no imágenes)
-            if block["block_type"] != "artifact":
-                view_mode = st.toggle("Ver Original", key=f"view_{source_name}_{idx}_{block_id}")
-            else:
-                view_mode = False
+            # -------------------------------------------------------------
+            # Botón "Ir al PDF": Navega al PDF viewer en la posición correcta.
+            # -------------------------------------------------------------
+            # Solo mostramos el botón si el bloque tiene página y es de un PDF.
+            # (No para Excel, CSV, etc.)
+            # -------------------------------------------------------------
+            source_file = block.get("source_file") or block.get("source") or ""
+            page_no = block.get("page_no")
+            is_pdf_source = source_file.lower().endswith(".pdf") or not source_file
+            
+            if page_no and is_pdf_source and block["block_type"] != "artifact":
+                if st.button("📍 Ir al PDF", key=f"gopdf_{source_name}_{idx}_{block_id}"):
+                    st.session_state.selected_block_id = block_id
+                    st.session_state.selected_page = page_no
+                    st.session_state.selected_block_source = Path(source_file).name if source_file else None
+                    st.rerun()
 
         # --- RENDERIZADO POR TIPO ---
         
@@ -552,84 +573,17 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
             if caption: 
                 st.markdown(f"**Tabla:** {caption}")
             
-            # 1. Si tenemos la imagen extraída por Docling, la mostramos PRIMERO (fuente de verdad)
+            # Mostrar la imagen de la tabla si existe (extraída por Docling)
             table_img_path = block.get("image_path")
             if table_img_path:
-                # Intentar múltiples rutas posibles
                 abs_path = Path(output_dir) / st.session_state.selected_paper_id / "artifacts" / Path(table_img_path).name
                 if not abs_path.exists():
                     abs_path = Path(table_img_path)
                 
                 if abs_path.exists():
                     st.image(str(abs_path), caption="Recorte Exacto de Tabla", use_container_width=True)
-            # -----------------------------------------------------------------
-            # FALLBACK: Recorte manual del PDF cuando no hay imagen guardada.
-            # -----------------------------------------------------------------
-            # Esto se ejecuta solo si:
-            #   - view_mode es True (el usuario activó "Ver Original")
-            #   - El bloque tiene número de página (page_no)
-            #   - El bloque tiene coordenadas (bbox = bounding box)
-            # -----------------------------------------------------------------
-            elif view_mode and block.get("page_no") and block.get("bbox"):
-                # -------------------------------------------------------------
-                # PASO 1: Encontrar el archivo PDF correcto para este bloque.
-                # -------------------------------------------------------------
-                # Usamos nuestra nueva función que busca el archivo real.
-                # 
-                # ARGUMENTOS:
-                #   block: La información del bloque actual (tiene source_file)
-                #   selected_paper_id: El nombre del paper (ej: "Almeida-2019")
-                #   DEFAULT_INPUT_DIR: Carpeta donde están los papers originales
-                # -------------------------------------------------------------
-                actual_pdf_path = resolve_source_pdf_path(
-                    block,                                    # El bloque actual
-                    st.session_state.selected_paper_id,       # Nombre del paper
-                    DEFAULT_INPUT_DIR                         # Carpeta de entrada
-                )
-                
-                # -------------------------------------------------------------
-                # PASO 2: Verificar que encontramos el archivo PDF.
-                # -------------------------------------------------------------
-                # actual_pdf_path será None si:
-                #   - El archivo no existe en el disco
-                #   - El archivo no es un PDF (es Excel, CSV, etc.)
-                # -------------------------------------------------------------
-                if actual_pdf_path:
-                    # ---------------------------------------------------------
-                    # PASO 3: Renderizar la página específica del PDF.
-                    # ---------------------------------------------------------
-                    # get_pdf_page_image() convierte una página PDF a imagen.
-                    # block["page_no"] indica qué página queremos ver.
-                    # ---------------------------------------------------------
-                    page_img = get_pdf_page_image(actual_pdf_path, block["page_no"])
-                    
-                    if page_img:
-                        # -----------------------------------------------------
-                        # PASO 4: Resaltar la región en la página completa.
-                        # -----------------------------------------------------
-                        # block["bbox"] contiene [izquierda, arriba, derecha, abajo]
-                        # Son las coordenadas exactas de donde está la tabla.
-                        # highlight_region_on_page() dibuja un rectángulo rojo
-                        # alrededor de esa región en la página completa.
-                        # -----------------------------------------------------
-                        highlighted_page = highlight_region_on_page(page_img, block["bbox"])
-                        
-                        # -----------------------------------------------------
-                        # PASO 5: Mostrar la página con el rectángulo.
-                        # -----------------------------------------------------
-                        # st.image() es una función de Streamlit que muestra imágenes.
-                        # caption= es el texto que aparece debajo de la imagen.
-                        # width="stretch" hace que use todo el ancho disponible.
-                        # -----------------------------------------------------
-                        st.image(highlighted_page, caption=f"📍 Página {block['page_no']} - Región resaltada en rojo", width="stretch")
-                else:
-                    # ---------------------------------------------------------
-                    # El archivo fuente no se encontró, mostrar advertencia.
-                    # ---------------------------------------------------------
-                    source_name_display = block.get("source_file") or block.get("source") or "desconocido"
-                    st.warning(f"⚠️ No se encontró el archivo fuente: {source_name_display}")
             
-            # 2. Toggle para ver los datos extraídos (OCR)
+            # Mostrar datos OCR extraídos
             with st.expander("📊 Ver Datos Extraídos (OCR)", expanded=False):
                 if "data" in block and block["data"]:
                     df = pd.DataFrame(block["data"])
@@ -642,70 +596,11 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
 
         # CASO 3: TEXTO
         elif block["block_type"] == "text":
-            # -----------------------------------------------------------------
-            # MODO "VER ORIGINAL": Mostrar el recorte del PDF.
-            # -----------------------------------------------------------------
-            # Si el usuario activó el toggle "Ver Original", mostramos la
-            # región exacta del PDF donde está este texto.
-            # -----------------------------------------------------------------
-            if view_mode:
-                # -------------------------------------------------------------
-                # PASO 1: Encontrar el archivo PDF correcto para este bloque.
-                # -------------------------------------------------------------
-                # Los bloques de texto siempre vienen de PDFs, pero pueden ser
-                # del PDF principal o de un PDF suplementario. Esta función
-                # busca el archivo correcto basándose en el campo "source_file".
-                # -------------------------------------------------------------
-                actual_pdf_path = resolve_source_pdf_path(
-                    block,                                    # El bloque de texto
-                    st.session_state.selected_paper_id,       # Nombre del paper
-                    DEFAULT_INPUT_DIR                         # Carpeta de entrada
-                )
-                
-                # -------------------------------------------------------------
-                # PASO 2: Si encontramos el PDF, mostrar el recorte.
-                # -------------------------------------------------------------
-                if actual_pdf_path:
-                    # ---------------------------------------------------------
-                    # PASO 3: Renderizar la página del PDF como imagen.
-                    # ---------------------------------------------------------
-                    # Usamos la función get_pdf_page_image que:
-                    #   1. Abre el archivo PDF
-                    #   2. Va a la página indicada (page_no)
-                    #   3. Convierte esa página a una imagen
-                    # ---------------------------------------------------------
-                    page_img = get_pdf_page_image(actual_pdf_path, block["page_no"])
-                    
-                    if page_img:
-                        # -----------------------------------------------------
-                        # PASO 4: Resaltar la región en la página completa.
-                        # -----------------------------------------------------
-                        # bbox significa "bounding box" (caja delimitadora).
-                        # Es un rectángulo que define exactamente dónde está
-                        # el texto en la página: [izquierda, arriba, derecha, abajo]
-                        #
-                        # Docling extrae estas coordenadas cuando procesa el PDF,
-                        # así sabemos exactamente dónde estaba cada elemento.
-                        # highlight_region_on_page() dibuja un rectángulo rojo
-                        # alrededor de esa región para que puedas verla en contexto.
-                        # -----------------------------------------------------
-                        highlighted_page = highlight_region_on_page(page_img, block["bbox"])
-                        
-                        # Mostrar la página completa con el rectángulo rojo
-                        st.image(highlighted_page, caption=f"📍 Página {block['page_no']} - Texto resaltado en rojo")
-                    else:
-                        st.warning("⚠️ No se pudo renderizar la página del PDF.")
-                else:
-                    # ---------------------------------------------------------
-                    # El archivo fuente no existe o no es un PDF.
-                    # ---------------------------------------------------------
-                    source_name_display = block.get("source_file") or block.get("source") or "principal"
-                    st.warning(f"⚠️ No se encontró el archivo fuente: {source_name_display}")
+            # Mostrar el texto extraído directamente
+            if is_important:
+                st.markdown(block["text"])
             else:
-                if is_important:
-                    st.markdown(block["text"])
-                else:
-                    st.markdown(f"<span style='color:grey'>{block['text']}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span style='color:grey'>{block['text']}</span>", unsafe_allow_html=True)
 
         # Context expansion buttons
         sc1, sc2 = st.columns(2)
@@ -935,27 +830,41 @@ def tab_execution():
                 st.code(traceback.format_exc())
 
 
+@st.cache_data(show_spinner=False)
+def get_cached_pdf_images(pdf_path):
+    """Convierte un PDF a una lista de imágenes PIL (cacheado)."""
+    try:
+        from pdf2image import convert_from_path
+        return convert_from_path(pdf_path, dpi=100) # 100 DPI es suficiente para pantalla y más rápido
+    except Exception as e:
+        return []
+
 def tab_review():
     """
     ==========================================================================
-    PESTAÑA DE REVISIÓN - LAYOUT SIDE-BY-SIDE
+    PESTAÑA DE REVISIÓN - NUEVO LAYOUT (PDF IZQUIERDA / TOOLS DERECHA)
     ==========================================================================
-    Esta función muestra la pestaña de revisión con dos columnas:
+    MODIFICACIÓN SOLICITADA:
+    Se ha invertido el layout original para coincidir con el diseño solicitado.
     
-    COLUMNA IZQUIERDA (40%):
-        - Lista de bloques extraídos (texto, tablas, figuras)
-        - Al hacer clic en un bloque, el PDF salta a esa ubicación
+    COLUMNA IZQUIERDA (PDF):
+        - Visor continuo o paginado
+        - Controles de navegación estilo "Clean"
     
-    COLUMNA DERECHA (60%):
-        - Visor de PDF interactivo
-        - Muestra anotaciones (rectángulos rojos) en las posiciones de los bloques
-        - Al hacer clic en una anotación, resalta el bloque en la lista
+    COLUMNA DERECHA (TOOLS):
+        - Pestañas: Parse | Split | Extract | Chat
+        - "Parse" contiene la lista de bloques extraídos (lógica original)
+    
+    NOTA: Se mantienen todas las llamadas al backend y la lógica de datos.
+    Solo se cambia la estructura visual (st.columns, st.tabs).
     ==========================================================================
     """
     st.header("📄 Revisar Papers")
     
     # -------------------------------------------------------------------------
     # Paso 1: Obtener el directorio de salida.
+    # -------------------------------------------------------------------------
+    # (Sin cambios en la lógica de backend)
     # -------------------------------------------------------------------------
     output_dir = st.session_state.get("output_dir", str(DEFAULT_OUTPUT_DIR))
     output_path = Path(output_dir)
@@ -999,157 +908,279 @@ def tab_review():
     # -------------------------------------------------------------------------
     # Paso 5: Estadísticas rápidas.
     # -------------------------------------------------------------------------
-    st.metric("📈 Total Bloques Relevantes", total_relevant)
+    # st.metric("📈 Total Bloques Relevantes", total_relevant) 
+    # (Comentado para limpiar la UI y que se parezca más al diseño "clean")
     
-    st.divider()
+    # st.divider() # Quitamos divider para limpiar
     
     # -------------------------------------------------------------------------
-    # Paso 6: LAYOUT SIDE-BY-SIDE.
+    # Paso 5a: Selector Global de Fuente (Sincronizado)
     # -------------------------------------------------------------------------
-    # Creamos dos columnas: izquierda para contenido, derecha para PDF.
+    source_options = list(grouped_blocks.keys())
+    
+    # Manejar sincronización desde botón "Ir al PDF"
+    if st.session_state.get("selected_block_source"):
+        target_src = st.session_state.selected_block_source
+        for opt in source_options:
+            if target_src in opt:
+                st.session_state.global_source_selector = opt
+                st.session_state.selected_block_source = None
+                break
+    
+    if "global_source_selector" not in st.session_state:
+        st.session_state.global_source_selector = source_options[0]
+        
     # -------------------------------------------------------------------------
-    col_content, col_pdf = st.columns([0.45, 0.55])
+    # CONTROLES SUPERIORES (BARRA DE HERRAMIENTAS)
+    # -------------------------------------------------------------------------
+    # Organizados en columnas para compactar la UI.
+    # -------------------------------------------------------------------------
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([0.4, 0.3, 0.3], gap="small", vertical_alignment="bottom")
     
-    # =========================================================================
-    # COLUMNA IZQUIERDA: Lista de Contenido Extraído
-    # =========================================================================
-    with col_content:
-        st.subheader("📋 Contenido Extraído")
-        
-        # Inicializar estado para el bloque seleccionado
-        if "selected_block_id" not in st.session_state:
-            st.session_state.selected_block_id = None
-        
-        # Iterar por cada fuente (PDF principal, suplementarios)
-        for source_name, blocks in grouped_blocks.items():
-            is_main = source_name.startswith("MAIN")
-            icon = "📕" if is_main else "📎"
-            
-            # Filtrar solo bloques relevantes
-            relevant_blocks = [b for b in blocks if b.get("has_quantitative_data")]
-            
-            if not relevant_blocks:
-                continue
-            
-            # Crear expander para esta fuente
-            with st.expander(f"{icon} {source_name} ({len(relevant_blocks)} relevantes)", expanded=is_main):
-                for block in relevant_blocks:
-                    block_id = block.get("id", "unknown")
-                    block_type = block.get("block_type", "unknown").upper()
-                    page_no = block.get("page_no", "-")
-                    
-                    # Determinar si este bloque está seleccionado
-                    is_selected = st.session_state.selected_block_id == block_id
-                    
-                    # Crear un contenedor con borde para cada bloque
-                    with st.container(border=True):
-                        # Header del bloque
-                        header_col, btn_col = st.columns([0.75, 0.25])
-                        
-                        with header_col:
-                            # Mostrar indicador si está seleccionado
-                            selected_marker = "🔴 " if is_selected else ""
-                            st.markdown(f"**{selected_marker}`{block_type}`** | Pág {page_no}")
-                        
-                        with btn_col:
-                            # Botón para ir a esta ubicación en el PDF
-                            if st.button("📍 Ver", key=f"goto_{source_name}_{block_id}", use_container_width=True):
-                                st.session_state.selected_block_id = block_id
-                                st.session_state.selected_page = page_no
-                                st.rerun()
-                        
-                        # Contenido del bloque según su tipo
-                        if block_type == "TEXT":
-                            # Mostrar un preview del texto (primeras 200 chars)
-                            text = block.get("text", "")
-                            preview = text[:200] + "..." if len(text) > 200 else text
-                            st.caption(preview)
-                        
-                        elif block_type == "TABLE":
-                            # Mostrar caption de la tabla si existe
-                            caption = block.get("caption", "Tabla sin título")
-                            st.caption(f"📊 {caption[:100]}...")
-                        
-                        elif block_type == "ARTIFACT":
-                            # Mostrar caption de la figura
-                            caption = block.get("caption", "Figura sin título")
-                            st.caption(f"🖼️ {caption[:100]}...")
+    with ctrl_col1:
+        selected_source = st.selectbox(
+            "📂 Documento", 
+            source_options,
+            key="global_source_selector",
+            label_visibility="collapsed" # Más limpio
+        )
     
-    # =========================================================================
-    # COLUMNA DERECHA: Visor de PDF Interactivo
-    # =========================================================================
-    with col_pdf:
-        st.subheader("📕 Documento Original")
-        
-        # ---------------------------------------------------------------------
-        # Paso A: Determinar qué PDF mostrar.
-        # ---------------------------------------------------------------------
-        # Por defecto, mostramos el PDF principal del paper.
-        # ---------------------------------------------------------------------
-        main_pdf_path = resolve_source_pdf_path(
-            {"source_file": f"{selected_paper}.pdf"},
-            selected_paper,
-            DEFAULT_INPUT_DIR
+    with ctrl_col2:
+        # Toggle para modo de vista
+        view_mode = st.radio(
+            "Visualización",
+            ["📄 Paginada", "📜 Continua"],
+            index=0, 
+            horizontal=True,
+            key="pdf_view_mode",
+            label_visibility="collapsed"
         )
         
-        if not main_pdf_path:
-            st.warning("No se encontró el PDF principal.")
-            return
+    with ctrl_col3:
+        # Ajuste de ancho de columnas (Invertido ahora: Izq PDF, Der Tools)
+        # El valor representa el ancho del PDF.
+        split_ratio = st.slider(
+            "↔️ Ancho PDF", 
+            min_value=0.2, 
+            max_value=0.8, 
+            value=0.6,  # Empezamos con el PDF más ancho (60%)
+            step=0.05,
+            label_visibility="collapsed"
+        )
+    
+    st.markdown("---") # Separador sutil
+    
+    # FILTRADO GLOBAL DE BLOQUES
+    grouped_blocks = {selected_source: grouped_blocks[selected_source]}
+    
+    # -------------------------------------------------------------------------
+    # Paso 6: NUEVO LAYOUT SIDE-BY-SIDE
+    # -------------------------------------------------------------------------
+    # CAMBIO IMPORTANTE:
+    # col_pdf (Izquierda) | col_tools (Derecha)
+    # -------------------------------------------------------------------------
+    col_pdf, col_tools = st.columns([split_ratio, 1 - split_ratio])
+    
+    # =========================================================================
+    # COLUMNA IZQUIERDA: Visor de PDF Original
+    # =========================================================================
+    with col_pdf:
+        # Estilo "Card" para el contenedor del PDF
+        with st.container(border=True):
+            
+            # Obtener la única fuente seleccionada
+            if not grouped_blocks:
+                st.warning("No hay datos para esta fuente.")
+            else:
+                current_source_name, current_blocks = list(grouped_blocks.items())[0]
+                
+                # Resolver ruta al PDF
+                current_pdf_path = None
+                is_main = current_source_name.startswith("MAIN")
+                
+                if is_main:
+                     main_pdf = resolve_source_pdf_path(
+                        {"source_file": f"{selected_paper}.pdf"},
+                        selected_paper,
+                        DEFAULT_INPUT_DIR
+                    )
+                     if main_pdf:
+                         current_pdf_path = main_pdf
+                else:
+                     for block in current_blocks:
+                          source_file = block.get("source_file") or block.get("source")
+                          if source_file and source_file.lower().endswith(".pdf"):
+                               current_pdf_path = resolve_source_pdf_path(block, selected_paper, DEFAULT_INPUT_DIR)
+                               break
+                
+                if not current_pdf_path:
+                     st.info(f"ℹ️ El archivo '{current_source_name}' no es un PDF visualizable.")
+                else:
+                    # Título sutil
+                    st.caption(f"Visualizando: {Path(current_pdf_path).name}")
+                    
+                    try:
+                        from streamlit_image_coordinates import streamlit_image_coordinates
+                        from PIL import ImageDraw
+                        
+                        # Carga de imágenes (Cacheada)
+                        with st.spinner("Cargando PDF..."):
+                            pages = get_cached_pdf_images(current_pdf_path)
+                        
+                        if not pages:
+                            st.error("No se pudo leer el archivo PDF.")
+                        else:
+                            is_continuous = "Continua" in st.session_state.get("pdf_view_mode", "")
+                            pages_to_render = [] 
+                            
+                            # ---------------------------------------------------------
+                            # CONTROLES DE NAVEGACIÓN COMPACTOS (Solo Paginado)
+                            # ---------------------------------------------------------
+                            if not is_continuous:
+                                total_pages = len(pages)
+                                current_page = st.session_state.get("selected_page", 1)
+                                if current_page < 1: current_page = 1
+                                if current_page > total_pages: current_page = total_pages
+                                st.session_state.selected_page = current_page
+                                
+                                # Barra de navegación centrada y minimalista
+                                nc1, nc2, nc3, nc4, nc5 = st.columns([2, 1, 2, 1, 2])
+                                with nc2:
+                                    if st.button("❮", disabled=current_page <= 1, key="nav_prev", use_container_width=True):
+                                        st.session_state.selected_page -= 1
+                                        st.rerun()
+                                with nc3:
+                                    st.markdown(f"<div style='text-align: center; font-weight: bold; padding-top: 5px'>{current_page} / {total_pages}</div>", unsafe_allow_html=True)
+                                with nc4:
+                                    if st.button("❯", disabled=current_page >= total_pages, key="nav_next", use_container_width=True):
+                                        st.session_state.selected_page += 1
+                                        st.rerun()
+                                        
+                                if total_pages > 0:
+                                    pages_to_render.append((pages[current_page-1], current_page))
+                            else:
+                                # Modo continuo: Mostrar todas
+                                for i, p in enumerate(pages):
+                                    pages_to_render.append((p, i + 1))
+
+                            # ---------------------------------------------------------
+                            # RENDERIZADO DE PÁGINAS E INTERACCIÓN
+                            # ---------------------------------------------------------
+                            # Usamos un scroll container para el PDF
+                            with st.container(height=800):
+                                for page_img_orig, current_page_num in pages_to_render:
+                                    if is_continuous:
+                                        st.caption(f"Página {current_page_num}")
+                                    
+                                    # Preparar imagen y overlay
+                                    page_img = page_img_orig.copy()
+                                    img_width, img_height = page_img.size
+                                    draw = ImageDraw.Draw(page_img)
+                                    scale_factor = 100 / 72  
+                                    pdf_page_height = img_height / scale_factor
+
+                                    # Filtrar bloques de esta página
+                                    block_coords = []
+                                    for i, block in enumerate(current_blocks): # Iteramos sobre bloques FILTRADOS por fuente
+                                        if (block.get("has_quantitative_data") and 
+                                            block.get("bbox") and 
+                                            block.get("page_no") == current_page_num):
+                                            
+                                            bbox = block.get("bbox")
+                                            block_id = block.get("id", str(i))
+                                            l, t, r, b = bbox
+                                            
+                                            x1 = int(l * scale_factor)
+                                            y1 = int((pdf_page_height - t) * scale_factor)
+                                            x2 = int(r * scale_factor)
+                                            y2 = int((pdf_page_height - b) * scale_factor)
+                                            
+                                            block_coords.append((x1, y1, x2, y2, block_id))
+                                            
+                                            is_selected = block_id == st.session_state.get("selected_block_id")
+                                            color = "#00FF00" if is_selected else "#FF0000"
+                                            width = 4 if is_selected else 2
+                                            
+                                            draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+                                            
+                                            # Label pequeño
+                                            # draw.text(...) # Podríamos poner label si se desea
+
+                                    # Render Interactivo
+                                    clicked = streamlit_image_coordinates(
+                                        page_img,
+                                        key=f"pdf_page_{current_page_num}_{st.session_state.get('global_source_selector','default')}_mode_{is_continuous}"
+                                    )
+                                    
+                                    if clicked is not None:
+                                        cx, cy = clicked["x"], clicked["y"]
+                                        for (bx1, by1, bx2, by2, bid) in block_coords:
+                                            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                                                if bid != st.session_state.get("selected_block_id"):
+                                                    st.session_state.selected_block_id = bid
+                                                    st.rerun()
+                                                break
+
+                    except Exception as e:
+                        st.error(f"Error renderizando PDF: {e}")
+
+    # =========================================================================
+    # COLUMNA DERECHA: Herramientas y Datos (Tabs)
+    # =========================================================================
+    with col_tools:
+        # Implementación de Pestañas como en el diseño
+        tabs = st.tabs(["✨ Parse", "✂️ Split", "🧪 Extract", "💬 Chat"])
         
-        # ---------------------------------------------------------------------
-        # Paso B: Generar anotaciones para todos los bloques relevantes.
-        # ---------------------------------------------------------------------
-        # Convertimos cada bloque a formato de anotación para pdf_viewer.
-        # ---------------------------------------------------------------------
-        annotations = []
-        for block in all_blocks:
-            if block.get("has_quantitative_data") and block.get("bbox"):
-                annotation = docling_bbox_to_pdf_annotation(
-                    block,
-                    page_height=792,  # Altura estándar de página carta
-                    color="red"
-                )
-                if annotation:
-                    annotations.append(annotation)
-        
-        # ---------------------------------------------------------------------
-        # Paso C: Determinar la página inicial a mostrar.
-        # ---------------------------------------------------------------------
-        # Si hay un bloque seleccionado, ir a su página.
-        # ---------------------------------------------------------------------
-        scroll_to_page = None
-        if st.session_state.get("selected_page"):
-            scroll_to_page = st.session_state.selected_page
-        
-        # ---------------------------------------------------------------------
-        # Paso D: Mostrar el visor de PDF.
-        # ---------------------------------------------------------------------
-        # pdf_viewer() renderiza el PDF con las anotaciones.
-        #
-        # Parámetros importantes:
-        #   - input: Ruta al archivo PDF
-        #   - annotations: Lista de anotaciones (rectángulos)
-        #   - scroll_to_page: Página a la que saltar inicialmente
-        #   - render_text: Si renderizar texto seleccionable
-        #   - width: Ancho del visor
-        #   - height: Alto del visor (aumentado para mejor visualización)
-        #
-        # NOTA: NO usamos pages_to_render para mostrar TODAS las páginas
-        #       y permitir explorar el documento completo.
-        # ---------------------------------------------------------------------
-        try:
-            pdf_viewer(
-                input=main_pdf_path,
-                annotations=annotations if annotations else None,
-                width="100%",
-                height=800,
-                render_text=True,
-                scroll_to_page=scroll_to_page
-            )
-        except Exception as e:
-            st.error(f"Error al cargar el PDF: {e}")
-            # Fallback: mostrar mensaje de error detallado
-            st.code(str(e))
+        # --- TAB: PARSE (Lógica original de visualización de datos) ---
+        with tabs[0]: 
+            st.markdown("##### Extracción Estructurada") # Título menor
+            
+            # Selector Markdown | JSON (simulado visualmente o funcional)
+            view_type = st.radio("Formato:", ["Markdown", "JSON"], horizontal=True, label_visibility="collapsed")
+            
+            if view_type == "JSON":
+                 st.json(data, expanded=False)
+            else:
+                # LISTA DE BLOQUES (Scrollable)
+                with st.container(height=750):
+                    
+                    # Inicializar estado selected
+                    if "selected_block_id" not in st.session_state:
+                         st.session_state.selected_block_id = None
+                    
+                    pdf_path = data.get("original_pdf")
+                    all_ordered_ids = [b.get("id") for b in all_blocks]
+                    
+                    # Botón para limpiar selección
+                    if st.session_state.get("selected_block_id"):
+                        if st.button("Desmarcar Selección", type="secondary"):
+                             st.session_state.selected_block_id = None
+                             st.rerun()
+
+                    # Iterar y mostrar bloques
+                    # Nota: grouped_blocks AQUÍ todavía tiene solo la fuente seleccionada
+                    # porque la filtramos arriba. Si queremos mostrar TODO el contenido
+                    # independientemente del PDF que se ve, deberíamos haber guardado
+                    # una copia de 'grouped_blocks' original.
+                    # PERO: El diseño sugiere que el panel derecho muestra lo relacionado
+                    # con el documento. Vamos a mantener la consistencia:
+                    # Mostrar bloques de la fuente activa.
+                    
+                    for source_name, blocks in grouped_blocks.items():
+                         # Renderizar cada bloque usando la función helper existente
+                         for i, block in enumerate(blocks):
+                                render_block(block, i, pdf_path, data, output_dir, all_ordered_ids, source_name=source_name)
+
+        # --- TABS: PLACEHOLDERS ---
+        with tabs[1]: # Split
+             st.info("🚧 **Splitter**\n\nHerramienta para dividir documentos grandes en secciones lógicas.\n*(Próximamente)*")
+             
+        with tabs[2]: # Extract
+             st.info("🚧 **Extractor**\n\nDefinición de esquemas de extracción personalizados y validación.\n*(Próximamente)*")
+             
+        with tabs[3]: # Chat
+             st.info("🚧 **Chat con tu Data**\n\nInterfaz conversacional para interrogar al documento.\n*(Próximamente)*")
+
 
 
 
