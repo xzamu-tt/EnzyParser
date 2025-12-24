@@ -583,8 +583,27 @@ def render_block(block, idx, pdf_path_str, paper_data, output_dir, ordered_ids, 
                 if abs_path.exists():
                     st.image(str(abs_path), caption="Recorte Exacto de Tabla", use_container_width=True)
             
-            # Mostrar datos OCR extraídos
-            with st.expander("📊 Ver Datos Extraídos (OCR)", expanded=False):
+            # Mostrar Mistral Markdown si existe (Editable)
+            mistral_md = block.get("markdown_content")
+            if mistral_md or block.get("has_quantitative_data"): # Show editor if available or if marked as relevant
+                with st.expander("🧠 Mistral OCR (Enriquecido / Editar)", expanded=True):
+                    # Editable Text Area
+                    new_md = st.text_area(
+                        "Contenido Markdown:",
+                        value=mistral_md if mistral_md else "",
+                        height=300,
+                        key=f"md_edit_{source_name}_{idx}_{block_id}"
+                    )
+                    
+                    if new_md != mistral_md:
+                        if st.button("💾 Guardar Edición", key=f"save_md_{source_name}_{idx}_{block_id}"):
+                            block["markdown_content"] = new_md
+                            save_paper_data(output_dir, st.session_state.selected_paper_id, paper_data)
+                            st.success("Guardado!")
+                            st.rerun()
+            
+            # Mostrar datos OCR extraídos (Docling)
+            with st.expander("📊 Ver Datos Extraídos (Docling)", expanded=False):
                 if "data" in block and block["data"]:
                     df = pd.DataFrame(block["data"])
                     st.dataframe(df, use_container_width=True)
@@ -824,6 +843,35 @@ def tab_execution():
                 st.success("✅ Clasificación completada!")
                 st.balloons()
                 
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+    
+    st.divider()
+
+    # --- STAGE 3: Mistral Enrichment ---
+    st.markdown("### 🧪 Etapa 3: Enriquecimiento OCR (Mistral)")
+    st.caption("Procesa tablas marcadas como 'Positivas' con Mistral OCR para obtener Markdown de alta fidelidad.")
+
+    if st.button("▶️ Enriquecer Tablas con Mistral OCR", type="secondary", use_container_width=True, disabled=len(paper_dirs) == 0):
+        try:
+            from enzyme_parser import EnzymeParser
+        except ImportError:
+            st.error("❌ No se pudo importar EnzymeParser.")
+            return
+
+        log_container = st.empty()
+        logs = []
+
+        with st.spinner("Enriqueciendo tablas..."):
+            try:
+                parser = EnzymeParser(input_dir, output_dir)
+                for msg in parser.enrich_existing_papers_streaming():
+                    logs.append(msg)
+                    log_container.code("\n".join(logs), language="")
+                
+                st.success("✨ Enriquecimiento completado!")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
                 import traceback

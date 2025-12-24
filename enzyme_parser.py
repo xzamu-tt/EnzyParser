@@ -19,6 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # Nuevos imports para Gemini y Env
 from dotenv import load_dotenv
 import google.generativeai as genai
+from mistral_enricher import MistralEnricher
 
 # Cargar variables de entorno
 load_dotenv()
@@ -222,6 +223,14 @@ class EnzymeParser:
         else:
             self.pipeline_options.do_picture_description = False
         
+        # Initialize Mistral Enricher
+        mistral_key = os.getenv("MISTRAL_API_KEY")
+        if mistral_key:
+            self.enricher = MistralEnricher(api_key=mistral_key)
+            logger.info("Mistral Enricher configured.")
+        else:
+            self.enricher = MistralEnricher() # Initialization will log warning
+            
         # Initialize converter
         self.converter = DocumentConverter(
             format_options={
@@ -410,6 +419,29 @@ class EnzymeParser:
                 with open(json_path, "w", encoding="utf-8") as f:
                     f.write(paper_data.model_dump_json(indent=2))
                 
+                # --- MISTRAL ENRICHMENT (Post-Classification) ---
+                if any(t.get("has_quantitative_data") for t in paper_data.tables_data):
+                     yield f"🧪 Enriching tables with Mistral OCR..."
+                     # Async wrapper for synchronous context (or proper async if using async framework)
+                     # Since this method is a generator, we can run the loop here
+                     import asyncio
+                     try:
+                         loop = asyncio.events.get_event_loop()
+                     except RuntimeError:
+                         loop = asyncio.new_event_loop()
+                         asyncio.set_event_loop(loop)
+                         
+                     paper_data.tables_data = loop.run_until_complete(
+                         self.enricher.process_paper_tables(paper_data.tables_data)
+                     )
+                     
+                     n_enriched = sum(1 for t in paper_data.tables_data if t.get("markdown_content"))
+                     yield f"  ✓ Enriched {n_enriched} tables with Markdown"
+
+                     # Save AGAIN with enriched data
+                     with open(json_path, "w", encoding="utf-8") as f:
+                        f.write(paper_data.model_dump_json(indent=2))
+                
                 yield f"💾 Saved: {json_path}"
                 classified_count += 1
                 
@@ -417,6 +449,78 @@ class EnzymeParser:
                 yield f"❌ Error classifying {paper_id}: {e}"
         
         yield f"\n✅ Classification complete! Classified: {classified_count}, Skipped: {skipped_count}"
+    
+    def enrich_existing_papers_streaming(self):
+        """
+        Stage 3: Run Mistral OCR Enrichment on already-parsed & classified JSON files.
+        Only processes tables with 'has_quantitative_data=True' and missing markdown.
+        """
+        if not self.has_gemini: # Mistral key is checked inside Enricher, but we can check here too
+             pass
+        
+        # Check Mistral Key implicit via self.enricher
+        if not self.enricher or not self.enricher.client:
+             yield "❌ Cannot run Enrichment: Mistral Client not initialized (Check MISTRAL_API_KEY)"
+             return
+
+        paper_dirs = [d for d in self.output_root.iterdir() if d.is_dir()]
+        yield f"📁 Found {len(paper_dirs)} paper directories. Scanning for tables to enrich..."
+        
+        enriched_count = 0
+        
+        import asyncio
+        try:
+            loop = asyncio.events.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        for i, paper_dir in enumerate(paper_dirs, 1):
+            paper_id = paper_dir.name
+            json_path = paper_dir / f"{paper_id}_data.json"
+            
+            if not json_path.exists():
+                continue
+            
+            try:
+                # Load
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                paper_data = PaperData(**data)
+                
+                # Check if needs enrichment
+                # Criteria: has_quantitative_data=True AND markdown_content is None/Empty
+                tables_to_enrich = [
+                    t for t in paper_data.tables_data 
+                    if t.get("has_quantitative_data") and not t.get("markdown_content")
+                ]
+                
+                if not tables_to_enrich:
+                    continue
+                
+                yield f"\n--- [{i}/{len(paper_dirs)}] Enriching: {paper_id} ---"
+                yield f"  🧪 Found {len(tables_to_enrich)} tables pending enrichment..."
+                
+                # Run Enrichment
+                paper_data.tables_data = loop.run_until_complete(
+                    self.enricher.process_paper_tables(paper_data.tables_data)
+                )
+                
+                n_newly_enriched = sum(1 for t in paper_data.tables_data if t.get("markdown_content") and t in tables_to_enrich) # Approximate check
+                
+                if n_newly_enriched > 0:
+                     # Save
+                     with open(json_path, "w", encoding="utf-8") as f:
+                        f.write(paper_data.model_dump_json(indent=2))
+                     yield f"  ✅ Enriched {n_newly_enriched} tables. Saved."
+                     enriched_count += 1
+                else:
+                     yield f"  ⚠️ No content extracted from tables."
+                
+            except Exception as e:
+                yield f"❌ Error processing {paper_id}: {e}"
+                
+        yield f"\n✨ Enrichment complete! Updated {enriched_count} papers."
     
     def process_paper_folder(self, folder_path: Path) -> None:
         """
@@ -776,7 +880,8 @@ class EnzymeParser:
                         "table_notes": ctx["notes"],
                         "data": data_records,
                         "image_path": table_img_path,  # Póliza de seguro visual
-                        "has_quantitative_data": True
+                        "has_quantitative_data": True,
+                        "markdown_content": None # Placeholder para Mistral OCR
                     })
                 except Exception as e:
                     logger.warning(f"Error extracting table {i}: {e}")

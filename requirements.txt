@@ -12,3 +12,4 @@ python-dotenv>=1.0.0
 streamlit>=1.30.0
 pdf2image>=1.17.0
 watchdog>=3.0.0
+mistralai>=1.0.0
