@@ -877,6 +877,35 @@ def tab_execution():
                 import traceback
                 st.code(traceback.format_exc())
 
+    st.divider()
+
+    # --- STAGE 4: Gemini Extraction ---
+    st.markdown("### 📊 Etapa 4: Extracción Estructurada (Gemini)")
+    st.caption("Extrae datos numéricos de las tablas enriquecidas y los convierte a formato CSV compatible.")
+
+    if st.button("▶️ Extraer Datos a CSV", type="primary", use_container_width=True, disabled=len(paper_dirs) == 0):
+        try:
+            from gemini_extractor import extract_existing_papers_streaming
+        except ImportError as e:
+            st.error(f"❌ No se pudo importar gemini_extractor: {e}")
+            return
+
+        log_container = st.empty()
+        logs = []
+
+        with st.spinner("Extrayendo datos..."):
+            try:
+                for msg in extract_existing_papers_streaming(Path(output_dir)):
+                    logs.append(msg)
+                    log_container.code("\n".join(logs), language="")
+                
+                st.success("📊 Extracción completada! CSVs generados.")
+                st.balloons()
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
 
 @st.cache_data(show_spinner=False)
 def get_cached_pdf_images(pdf_path):
